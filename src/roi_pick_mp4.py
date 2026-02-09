@@ -3,7 +3,7 @@ import os
 
 import cv2
 
-from utils_rois import save_rois
+from .utils_rois import save_rois
 
 
 def parse_args():
