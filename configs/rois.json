@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "seats": [
+    {
+      "id": "seat-1",
+      "label": "Seat 1",
+      "roi": {
+        "x": 0,
+        "y": 0,
+        "width": 0,
+        "height": 0
+      }
+    }
+  ]
+}
