@@ -1,0 +1,3 @@
+numpy==1.26.4
+# OpenCV and picamera2 are installed via apt on the Pi (no pip opencv by default).
+# mediapipe==0.10.18  # Optional: enable only if confirmed working on the Pi.
