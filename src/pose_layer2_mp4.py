@@ -9,7 +9,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-from utils_rois import crop, load_rois
+from .utils_rois import crop, load_rois
 
 
 """
