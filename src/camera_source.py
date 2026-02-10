@@ -1,4 +1,5 @@
 import cv2
+import time
 
 
 class OpenCVCameraSource:
@@ -16,7 +17,18 @@ class OpenCVCameraSource:
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
-        return True
+
+        # Some camera stacks report "opened" before frames are actually ready.
+        # Probe a few reads so create_camera_source can fall back to Picamera2 when
+        # OpenCV cannot deliver frames.
+        for _ in range(8):
+            ok, frame = self.cap.read()
+            if ok and frame is not None:
+                return True
+            time.sleep(0.05)
+
+        self.release()
+        return False
 
     def read(self):
         if self.cap is None:
@@ -54,8 +66,11 @@ class Picamera2Source:
     def read(self):
         if self.picam2 is None:
             return False, None
-        frame_rgb = self.picam2.capture_array("main")
-        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        try:
+            frame_rgb = self.picam2.capture_array("main")
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        except Exception:
+            return False, None
         return True, frame_bgr
 
     def release(self):
