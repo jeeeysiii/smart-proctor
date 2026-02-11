@@ -1,0 +1,48 @@
+[WARN] OpenCV camera index 0 failed: opened but failed to read any frames
+[ WARN:0@1.893] global cap_v4l.cpp:913 open VIDEOIO(V4L2:/dev/video1): can't open camera by index
+[ WARN:0@1.894] global obsensor_stream_channel_v4l2.cpp:82 xioctl ioctl: fd=3, req=-2140645888
+[ WARN:0@1.894] global obsensor_stream_channel_v4l2.cpp:138 queryUvcDeviceInfoList ioctl error return: 25
+[ WARN:0@1.971] global obsensor_stream_channel_v4l2.cpp:82 xioctl ioctl: fd=3, req=-2140645888
+[ WARN:0@1.971] global obsensor_stream_channel_v4l2.cpp:138 queryUvcDeviceInfoList ioctl error return: 25
+[ERROR:0@1.973] global obsensor_uvc_stream_channel.cpp:158 getStreamChannelGroup Camera index out of range
+[WARN] OpenCV camera index 1 failed: cannot open capture device
+[ WARN:0@1.973] global cap_v4l.cpp:913 open VIDEOIO(V4L2:/dev/video2): can't open camera by index
+[ WARN:0@1.973] global obsensor_stream_channel_v4l2.cpp:82 xioctl ioctl: fd=3, req=-2140645888
+[ WARN:0@1.973] global obsensor_stream_channel_v4l2.cpp:138 queryUvcDeviceInfoList ioctl error return: 25
+[ WARN:0@2.087] global obsensor_stream_channel_v4l2.cpp:82 xioctl ioctl: fd=3, req=-2140645888
+[ WARN:0@2.087] global obsensor_stream_channel_v4l2.cpp:138 queryUvcDeviceInfoList ioctl error return: 25
+[ERROR:0@2.089] global obsensor_uvc_stream_channel.cpp:158 getStreamChannelGroup Camera index out of range
+[WARN] OpenCV camera index 2 failed: cannot open capture device
+[ WARN:0@2.089] global cap_v4l.cpp:913 open VIDEOIO(V4L2:/dev/video3): can't open camera by index
+[ WARN:0@2.089] global obsensor_stream_channel_v4l2.cpp:82 xioctl ioctl: fd=3, req=-2140645888
+[ WARN:0@2.089] global obsensor_stream_channel_v4l2.cpp:138 queryUvcDeviceInfoList ioctl error return: 25
+[ WARN:0@2.089] global obsensor_stream_channel_v4l2.cpp:82 xioctl ioctl: fd=3, req=-2140645888
+[ WARN:0@2.089] global obsensor_stream_channel_v4l2.cpp:138 queryUvcDeviceInfoList ioctl error return: 25
+[ERROR:0@2.091] global obsensor_uvc_stream_channel.cpp:158 getStreamChannelGroup Camera index out of range
+[WARN] OpenCV camera index 3 failed: cannot open capture device
+[ WARN:0@2.091] global cap_v4l.cpp:913 open VIDEOIO(V4L2:/dev/video4): can't open camera by index
+[ WARN:0@2.092] global obsensor_stream_channel_v4l2.cpp:82 xioctl ioctl: fd=3, req=-2140645888
+[ WARN:0@2.092] global obsensor_stream_channel_v4l2.cpp:138 queryUvcDeviceInfoList ioctl error return: 25
+[ WARN:0@2.207] global obsensor_stream_channel_v4l2.cpp:82 xioctl ioctl: fd=3, req=-2140645888
+[ WARN:0@2.207] global obsensor_stream_channel_v4l2.cpp:138 queryUvcDeviceInfoList ioctl error return: 25
+[ERROR:0@2.209] global obsensor_uvc_stream_channel.cpp:158 getStreamChannelGroup Camera index out of range
+[WARN] OpenCV camera index 4 failed: cannot open capture device
+[WARN] Picamera2 failed: import failed: No module named 'picamera2'
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/smartproctoring/smart-proctor/src/live_proctor.py", line 342, in <module>
+    main()
+  File "/home/smartproctoring/smart-proctor/src/live_proctor.py", line 266, in main
+    camera, backend, _ = create_camera_source(
+                         ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/smartproctoring/smart-proctor/src/camera_source.py", line 192, in create_camera_source
+    raise RuntimeError(
+RuntimeError: Unable to open camera via OpenCV and Picamera2 fallback.
+OpenCV indices tried: [0, 1, 2, 3, 4]
+OpenCV failures: 0: opened but failed to read any frames, 1: cannot open capture device, 2: cannot open capture device, 3: cannot open capture device, 4: cannot open capture device
+Picamera2 failure: import failed: No module named 'picamera2'
+Suggestions:
+- Enable camera stack in raspi-config and reboot.
+- Check CSI cable orientation and seating on both ends.
+- Confirm user is in the 'video' group (or use sudo only for debugging).
