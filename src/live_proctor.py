@@ -107,7 +107,8 @@ def parse_args():
     parser.add_argument("--headless", action="store_true", help="Disable GUI preview")
     parser.add_argument("--model-complexity", type=int, default=0, choices=[0, 1, 2], help="MediaPipe Pose model complexity")
     parser.add_argument("--save-evidence", action="store_true", help="Reserved for future evidence saving (currently no-op)")
-    parser.add_argument("--camera-device", default="/dev/video0", help="OpenCV camera device path")
+    parser.add_argument("--camera-device", default=None, help="Optional OpenCV camera device/index override")
+    parser.add_argument("--opencv-index", type=int, default=None, help="Explicit OpenCV camera index to try first")
     return parser.parse_args()
 
 
@@ -262,11 +263,12 @@ def main():
         print("[WARN] DISPLAY not available. Falling back to headless mode.", flush=True)
         headless = True
 
-    camera, backend = create_camera_source(
+    camera, backend, _ = create_camera_source(
         width=args.width,
         height=args.height,
         fps=args.fps,
         device=args.camera_device,
+        opencv_index=args.opencv_index,
     )
     print(f"[INFO] Camera backend: {backend}", flush=True)
 
