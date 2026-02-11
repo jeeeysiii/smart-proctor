@@ -3,9 +3,17 @@ import os
 import subprocess
 from pathlib import Path
 
-import cv2
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
-from .camera_source import OpenCVCameraSource, Picamera2Source
+if cv2 is not None:
+    from .camera_source import OpenCVCameraSource, Picamera2Source, _candidate_devices
+else:
+    OpenCVCameraSource = None
+    Picamera2Source = None
+    _candidate_devices = None
 
 
 def run_cmd(args):
@@ -21,6 +29,8 @@ def display_available():
 
 
 def maybe_preview(frame, title):
+    if cv2 is None:
+        return
     if not display_available():
         print("[INFO] No DISPLAY/WAYLAND detected; skipping preview window.", flush=True)
         return
@@ -31,6 +41,9 @@ def maybe_preview(frame, title):
 
 
 def save_frame(frame):
+    if cv2 is None:
+        print("[WARN] Cannot save frame because cv2 is not installed.", flush=True)
+        return
     out_path = Path("data") / "camera_test.jpg"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ok = cv2.imwrite(str(out_path), frame)
@@ -40,22 +53,29 @@ def save_frame(frame):
         print(f"[WARN] Failed to save test frame: {out_path}", flush=True)
 
 
-def try_opencv_indices(width=640, height=360, fps=20):
-    print("\n[DIAG] Testing OpenCV camera indices 0..4", flush=True)
-    for idx in range(5):
-        source = OpenCVCameraSource(device=idx, width=width, height=height, fps=fps)
+def try_opencv_devices(width=640, height=360, fps=20):
+    if cv2 is None:
+        print("\n[DIAG] OpenCV unavailable: No module named 'cv2'", flush=True)
+        return False
+
+    print("\n[DIAG] Testing OpenCV camera devices", flush=True)
+    candidates = _candidate_devices(device=None, opencv_index=None)
+    print(f"[DIAG] OpenCV candidates: {candidates}", flush=True)
+
+    for dev in candidates:
+        source = OpenCVCameraSource(device=dev, width=width, height=height, fps=fps)
         if not source.open():
-            print(f"  - index {idx}: FAIL ({source.last_error})", flush=True)
+            print(f"  - device {dev}: FAIL ({source.last_error})", flush=True)
             continue
 
         ok, frame = source.read()
         if not ok or frame is None or frame.size == 0:
-            print(f"  - index {idx}: FAIL (opened but read failed)", flush=True)
+            print(f"  - device {dev}: FAIL (opened but read failed)", flush=True)
             source.release()
             continue
 
-        print(f"  - index {idx}: OK (shape={frame.shape})", flush=True)
-        maybe_preview(frame, f"OpenCV index {idx}")
+        print(f"  - device {dev}: OK (shape={frame.shape})", flush=True)
+        maybe_preview(frame, f"OpenCV {dev}")
         save_frame(frame)
         source.release()
         return True
@@ -65,9 +85,16 @@ def try_opencv_indices(width=640, height=360, fps=20):
 
 def try_picamera2(width=640, height=360, fps=20):
     print("\n[DIAG] Testing Picamera2", flush=True)
+    if Picamera2Source is None:
+        print("  - Picamera2: SKIP (cv2 missing in this Python environment)", flush=True)
+        return False
+
     source = Picamera2Source(width=width, height=height, fps=fps)
     if not source.open():
         print(f"  - Picamera2: FAIL ({source.last_error})", flush=True)
+        if source.last_error and "No module named 'picamera2'" in source.last_error:
+            print("  - Hint: install with `sudo apt install -y python3-picamera2`", flush=True)
+            print("  - Hint: if using venv, create with `--system-site-packages`", flush=True)
         return False
 
     ok, frame = source.read()
@@ -90,11 +117,11 @@ def main():
     print(f"/dev/video* nodes: {video_nodes if video_nodes else '<none>'}", flush=True)
     print(f"groups: {run_cmd(['groups'])}", flush=True)
 
-    opencv_ok = try_opencv_indices()
+    opencv_ok = try_opencv_devices()
     picam_ok = try_picamera2()
 
     print("\n[DIAG] Summary", flush=True)
-    print(f"OpenCV indices 0..4: {'PASS' if opencv_ok else 'FAIL'}", flush=True)
+    print(f"OpenCV: {'PASS' if opencv_ok else 'FAIL'}", flush=True)
     print(f"Picamera2: {'PASS' if picam_ok else 'FAIL'}", flush=True)
 
     if not opencv_ok and not picam_ok:
