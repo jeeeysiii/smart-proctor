@@ -1,6 +1,7 @@
 import glob
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 try:
@@ -94,7 +95,8 @@ def try_picamera2(width=640, height=360, fps=20):
         print(f"  - Picamera2: FAIL ({source.last_error})", flush=True)
         if source.last_error and "No module named 'picamera2'" in source.last_error:
             print("  - Hint: install with `sudo apt install -y python3-picamera2`", flush=True)
-            print("  - Hint: if using venv, create with `--system-site-packages`", flush=True)
+            print("  - Hint: run with `/usr/bin/python3 -m src.camera_diagnose`", flush=True)
+            print("  - Hint: if using venv, recreate with `--system-site-packages`", flush=True)
         return False
 
     ok, frame = source.read()
@@ -113,20 +115,24 @@ def try_picamera2(width=640, height=360, fps=20):
 def main():
     print("[DIAG] System info", flush=True)
     print(f"uname -a: {run_cmd(['uname', '-a'])}", flush=True)
+    print(f"python executable: {sys.executable}", flush=True)
+    print(f"python version: {sys.version.split()[0]}", flush=True)
+    system_check = run_cmd(['python3', '-c', 'import picamera2; print(\"ok\")'])
+    print(f"system python picamera2 check: {system_check}", flush=True)
     video_nodes = sorted(glob.glob('/dev/video*'))
     print(f"/dev/video* nodes: {video_nodes if video_nodes else '<none>'}", flush=True)
     print(f"groups: {run_cmd(['groups'])}", flush=True)
 
-    opencv_ok = try_opencv_devices()
     picam_ok = try_picamera2()
+    opencv_ok = try_opencv_devices() if not picam_ok else False
 
     print("\n[DIAG] Summary", flush=True)
-    print(f"OpenCV: {'PASS' if opencv_ok else 'FAIL'}", flush=True)
     print(f"Picamera2: {'PASS' if picam_ok else 'FAIL'}", flush=True)
+    print(f"OpenCV: {'PASS' if opencv_ok else 'FAIL'}", flush=True)
 
     if not opencv_ok and not picam_ok:
         print(
-            "[DIAG] No backend worked. Check camera enablement (raspi-config), CSI cable orientation, reboot, and video-group membership.",
+            "[DIAG] No backend worked. Check camera enablement (raspi-config), CSI cable orientation, reboot, and Python environment mismatch.",
             flush=True,
         )
 

@@ -1,5 +1,7 @@
-import glob
+import os
 import platform
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -9,9 +11,29 @@ import cv2
 
 @dataclass
 class CameraInitReport:
-    opencv_indices_tried: List[str] = field(default_factory=list)
+    opencv_devices_tried: List[str] = field(default_factory=list)
     opencv_errors: Dict[str, str] = field(default_factory=dict)
     picamera2_error: Optional[str] = None
+
+
+def _is_raspberry_pi():
+    try:
+        with open("/proc/device-tree/model", "r", encoding="utf-8", errors="ignore") as f:
+            return "raspberry pi" in f.read().lower()
+    except Exception:
+        return False
+
+
+def _picamera2_import_diagnostic():
+    exe = sys.executable
+    cmd = ["python3", "-c", "import picamera2; print('ok')"]
+    check = "unknown"
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()
+        check = out or "ok"
+    except Exception as exc:
+        check = f"failed ({exc})"
+    return f"current_python={exe}; system_python_picamera2_check={check}"
 
 
 class OpenCVCameraSource:
@@ -25,7 +47,6 @@ class OpenCVCameraSource:
         self.last_error = None
 
     def _open_capture(self):
-        # On Raspberry Pi/Linux, CAP_V4L2 avoids probing unrelated OpenCV backends.
         if platform.system().lower() == "linux":
             cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
             if cap.isOpened():
@@ -103,7 +124,7 @@ class Picamera2Source:
         try:
             from picamera2 import Picamera2
         except ImportError as exc:
-            self.last_error = f"import failed: {exc}"
+            self.last_error = f"import failed: {exc}; {_picamera2_import_diagnostic()}"
             return False
 
         try:
@@ -168,22 +189,37 @@ def _candidate_devices(device=None, opencv_index=None):
         except (TypeError, ValueError):
             candidates.append(str(device))
     else:
+        # Keep probing tight to avoid noisy non-camera nodes on Bookworm.
         candidates.extend(range(5))
-
-    # On Pi/libcamera setups, some OpenCV builds only open by path.
-    for path in sorted(glob.glob("/dev/video*")):
-        if path not in candidates:
-            candidates.append(path)
+        for idx in range(5):
+            path = f"/dev/video{idx}"
+            if os.path.exists(path) and path not in candidates:
+                candidates.append(path)
 
     return candidates
+
+
+def _try_picamera2_first(device=None, opencv_index=None):
+    # If user explicitly requested OpenCV selection, respect that.
+    if opencv_index is not None or device is not None:
+        return False
+    return _is_raspberry_pi()
 
 
 def create_camera_source(width=640, height=360, fps=20, device=None, opencv_index=None):
     report = CameraInitReport()
 
+    if _try_picamera2_first(device=device, opencv_index=opencv_index):
+        picamera_source = Picamera2Source(width=width, height=height, fps=fps)
+        if picamera_source.open():
+            print("[INFO] Picamera2 opened successfully (preferred on Raspberry Pi).", flush=True)
+            return picamera_source, "picamera2", report
+        report.picamera2_error = picamera_source.last_error or "unknown error"
+        print(f"[WARN] Picamera2 pre-check failed: {report.picamera2_error}", flush=True)
+
     for candidate in _candidate_devices(device=device, opencv_index=opencv_index):
         key = str(candidate)
-        report.opencv_indices_tried.append(key)
+        report.opencv_devices_tried.append(key)
         source = OpenCVCameraSource(device=candidate, width=width, height=height, fps=fps)
         if source.open():
             print(f"[INFO] OpenCV camera device {candidate} opened successfully.", flush=True)
@@ -202,18 +238,18 @@ def create_camera_source(width=640, height=360, fps=20, device=None, opencv_inde
     print(f"[WARN] Picamera2 failed: {report.picamera2_error}", flush=True)
 
     opencv_diag = ", ".join(
-        f"{dev}: {report.opencv_errors.get(dev, 'unknown error')}" for dev in report.opencv_indices_tried
+        f"{dev}: {report.opencv_errors.get(dev, 'unknown error')}" for dev in report.opencv_devices_tried
     ) or "none"
 
     raise RuntimeError(
         "Unable to open camera via OpenCV and Picamera2 fallback.\n"
-        f"OpenCV devices tried: {report.opencv_indices_tried}\n"
+        f"OpenCV devices tried: {report.opencv_devices_tried}\n"
         f"OpenCV failures: {opencv_diag}\n"
         f"Picamera2 failure: {report.picamera2_error}\n"
         "Suggestions:\n"
         "- Enable camera stack in raspi-config and reboot.\n"
         "- Check CSI cable orientation and seating on both ends.\n"
         "- Confirm user is in the 'video' group (or use sudo only for debugging).\n"
-        "- If Picamera2 import failed, install it with: sudo apt install -y python3-picamera2.\n"
-        "- If using a venv, run with system Python or create the venv with --system-site-packages."
+        "- Install Picamera2 in system Python: sudo apt install -y python3-picamera2.\n"
+        "- If using a virtualenv, create it with --system-site-packages or run with /usr/bin/python3."
     )
