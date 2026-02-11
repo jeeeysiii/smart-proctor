@@ -1,0 +1,163 @@
+[DIAG] System info
+uname -a: Linux smartproctoring 6.12.62+rpt-rpi-v8 #1 SMP PREEMPT Debian 1:6.12.62-1+rpt1~bookworm (2026-01-19) aarch64 GNU/Linux
+/dev/video* nodes: ['/dev/video0', '/dev/video1', '/dev/video10', '/dev/video11', '/dev/video12', '/dev/video13', '/dev/video14', '/dev/video15', '/dev/video16', '/dev/video18', '/dev/video19', '/dev/video20', '/dev/video21', '/dev/video22', '/dev/video23', '/dev/video31']
+groups: smartproctoring adm dialout cdrom sudo audio video plugdev games users input render netdev lpadmin gpio i2c spi
+
+[DIAG] Testing OpenCV camera devices
+[DIAG] OpenCV candidates: [0, 1, 2, 3, 4, '/dev/video0', '/dev/video1', '/dev/video10', '/dev/video11', '/dev/video12', '/dev/video13', '/dev/video14', '/dev/video15', '/dev/video16', '/dev/video18', '/dev/video19', '/dev/video20', '/dev/video21', '/dev/video22', '/dev/video23', '/dev/video31']
+  - device 0: FAIL (opened but failed to read any frames)
+[ WARN:0@0.316] global cap_v4l.cpp:913 open VIDEOIO(V4L2:/dev/video1): can't open camera by index
+[ WARN:0@0.316] global cap.cpp:478 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by index
+[ WARN:0@0.316] global cap_v4l.cpp:913 open VIDEOIO(V4L2:/dev/video1): can't open camera by index
+[ WARN:0@0.317] global obsensor_stream_channel_v4l2.cpp:82 xioctl ioctl: fd=3, req=-2140645888
+[ WARN:0@0.317] global obsensor_stream_channel_v4l2.cpp:138 queryUvcDeviceInfoList ioctl error return: 25
+[ WARN:0@0.394] global obsensor_stream_channel_v4l2.cpp:82 xioctl ioctl: fd=3, req=-2140645888
+[ WARN:0@0.394] global obsensor_stream_channel_v4l2.cpp:138 queryUvcDeviceInfoList ioctl error return: 25
+[ERROR:0@0.396] global obsensor_uvc_stream_channel.cpp:158 getStreamChannelGroup Camera index out of range
+  - device 1: FAIL (cannot open capture device)
+[ WARN:0@0.397] global cap_v4l.cpp:913 open VIDEOIO(V4L2:/dev/video2): can't open camera by index
+[ WARN:0@0.397] global cap.cpp:478 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by index
+[ WARN:0@0.397] global cap_v4l.cpp:913 open VIDEOIO(V4L2:/dev/video2): can't open camera by index
+[ WARN:0@0.397] global obsensor_stream_channel_v4l2.cpp:82 xioctl ioctl: fd=3, req=-2140645888
+[ WARN:0@0.397] global obsensor_stream_channel_v4l2.cpp:138 queryUvcDeviceInfoList ioctl error return: 25
+[ WARN:0@0.518] global obsensor_stream_channel_v4l2.cpp:82 xioctl ioctl: fd=3, req=-2140645888
+[ WARN:0@0.518] global obsensor_stream_channel_v4l2.cpp:138 queryUvcDeviceInfoList ioctl error return: 25
+[ERROR:0@0.520] global obsensor_uvc_stream_channel.cpp:158 getStreamChannelGroup Camera index out of range
+  - device 2: FAIL (cannot open capture device)
+[ WARN:0@0.521] global cap_v4l.cpp:913 open VIDEOIO(V4L2:/dev/video3): can't open camera by index
+[ WARN:0@0.521] global cap.cpp:478 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by index
+[ WARN:0@0.521] global cap_v4l.cpp:913 open VIDEOIO(V4L2:/dev/video3): can't open camera by index
+[ WARN:0@0.521] global obsensor_stream_channel_v4l2.cpp:82 xioctl ioctl: fd=3, req=-2140645888
+[ WARN:0@0.521] global obsensor_stream_channel_v4l2.cpp:138 queryUvcDeviceInfoList ioctl error return: 25
+[ WARN:0@0.638] global obsensor_stream_channel_v4l2.cpp:82 xioctl ioctl: fd=3, req=-2140645888
+[ WARN:0@0.638] global obsensor_stream_channel_v4l2.cpp:138 queryUvcDeviceInfoList ioctl error return: 25
+[ERROR:0@0.640] global obsensor_uvc_stream_channel.cpp:158 getStreamChannelGroup Camera index out of range
+  - device 3: FAIL (cannot open capture device)
+[ WARN:0@0.640] global cap_v4l.cpp:913 open VIDEOIO(V4L2:/dev/video4): can't open camera by index
+[ WARN:0@0.641] global cap.cpp:478 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by index
+[ WARN:0@0.641] global cap_v4l.cpp:913 open VIDEOIO(V4L2:/dev/video4): can't open camera by index
+[ WARN:0@0.641] global obsensor_stream_channel_v4l2.cpp:82 xioctl ioctl: fd=3, req=-2140645888
+[ WARN:0@0.641] global obsensor_stream_channel_v4l2.cpp:138 queryUvcDeviceInfoList ioctl error return: 25
+[ WARN:0@0.758] global obsensor_stream_channel_v4l2.cpp:82 xioctl ioctl: fd=3, req=-2140645888
+[ WARN:0@0.758] global obsensor_stream_channel_v4l2.cpp:138 queryUvcDeviceInfoList ioctl error return: 25
+[ERROR:0@0.760] global obsensor_uvc_stream_channel.cpp:158 getStreamChannelGroup Camera index out of range
+  - device 4: FAIL (cannot open capture device)
+  - device /dev/video0: FAIL (opened but failed to read any frames)
+[ WARN:0@1.016] global cap.cpp:215 open VIDEOIO(V4L2): backend is generally available but can't be used to capture by name
+
+
+import json
+import time
+from dataclasses import dataclass
+import cv2
+import numpy as np
+from picamera2 import Picamera2
+
+ROI_PATH = "configs/rois.json"
+
+@dataclass
+class ROIState:
+    prev_gray: np.ndarray | None = None
+    motion_score: int = 0
+    last_motion_ts: float = 0.0
+
+def load_rois(path=ROI_PATH):
+    with open(path, "r") as f:
+        data = json.load(f)
+    return data["rois"]
+
+def crop(frame_bgr, r):
+    x, y, w, h = r["x"], r["y"], r["w"], r["h"]
+    return frame_bgr[y:y+h, x:x+w]
+
+def motion_score(prev_gray, gray, thresh=25):
+    # Basic frame differencing
+    diff = cv2.absdiff(gray, prev_gray)
+    diff = cv2.GaussianBlur(diff, (5, 5), 0)
+    _, bw = cv2.threshold(diff, thresh, 255, cv2.THRESH_BINARY)
+    # Count changed pixels
+    return int(cv2.countNonZero(bw))
+
+def main():
+    rois = load_rois()
+    states = {r["id"]: ROIState() for r in rois}
+
+    picam2 = Picamera2()
+    picam2.configure(picam2.create_preview_configuration(
+        main={"size": (1280, 720), "format": "RGB888"}
+    ))
+    picam2.start()
+
+    # Tuning parameters (adjust later)
+    PIXEL_THRESH = 25
+    MOTION_ON = 2500      # raise/lower based on ROI size + noise
+    MOTION_OFF = 1200     # hysteresis
+    REPORT_EVERY = 1.0    # seconds
+
+    last_report = time.time()
+
+    # If you want HDMI overlay later, set to True.
+    SHOW = True
+
+    while True:
+        frame = picam2.capture_array()             # RGB
+
+        now = time.time()
+        seat_status = []
+
+        for r in rois:
+            sid = r["id"]
+            roi = crop(frame, r)
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+            st = states[sid]
+            if st.prev_gray is None:
+                st.prev_gray = gray
+                st.motion_score = 0
+            else:
+                score = motion_score(st.prev_gray, gray, thresh=PIXEL_THRESH)
+                st.prev_gray = gray
+                st.motion_score = score
+
+                # simple status with hysteresis
+                moving = score >= MOTION_ON or (st.last_motion_ts > 0 and score >= MOTION_OFF and (now - st.last_motion_ts) < 1.0)
+                if moving:
+                    st.last_motion_ts = now
+
+            seat_status.append((sid, st.motion_score))
+
+            if SHOW:
+                x, y, w, h = r["x"], r["y"], r["w"], r["h"]
+
+                moving = st.motion_score >= MOTION_ON
+                color = (0, 0, 255) if moving else (255, 255, 255)
+
+                cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+
+		# Seat ID + raw motion score (top)
+                cv2.putText(frame, f"S{sid}:{st.motion_score}", (x+10, y+30),
+                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+		# Status label (bottom)
+                status = "MOVE" if moving else "OK"
+                cv2.putText(frame, status, (x+10, y+h-10),
+                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+
+        # periodic console report
+        if now - last_report >= REPORT_EVERY:
+            last_report = now
+            seat_status.sort(key=lambda x: x[0])
+            msg = " | ".join([f"S{sid}:{score}" for sid, score in seat_status])
+            print(msg)
+
+        if SHOW:
+            cv2.imshow("Motion Sweep", frame)
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+
+    if SHOW:
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
