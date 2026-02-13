@@ -13,7 +13,7 @@ from .utils_rois import crop, load_rois
 
 SIGNAL_NAMES = ["TURN", "ROT", "BOUND", "REACH", "LEAN", "HEAD_DOWN", "STAND", "EMPTY"]
 POINTS = {
-    "TURN": 1,
+    "TURN": 2,
     "ROT": 0,
     "BOUND": 2,
     "REACH": 3,
@@ -32,6 +32,9 @@ LEAN_X_THRESH = 0.50
 HEAD_DOWN_THRESH = 0.15
 STAND_Y_THRESH = 0.12
 ROT_DELTA_THRESH = 15.0
+ASYM_TURN_THRESH = 0.18
+
+DEBUG_OVERLAY = False
 
 ROLLING_N = 10
 WARN_POINTS = 2
@@ -68,6 +71,7 @@ class StudentState:
         required = [
             "shoulder_angle_deg",
             "head_offset",
+            "head_asym",
             "shoulder_mid_x",
             "head_drop",
             "shoulder_width",
@@ -75,7 +79,8 @@ class StudentState:
         ]
         if any(metrics.get(k) is None for k in required):
             return
-        if any(signals.get(name, False) for name in STRONG_SIGNALS):
+        neutral_blockers = STRONG_SIGNALS.union({"TURN", "LEAN", "HEAD_DOWN", "ROT"})
+        if any(signals.get(name, False) for name in neutral_blockers):
             return
         if signals.get("EMPTY", False):
             return
@@ -211,6 +216,8 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
         "shoulder_angle_deg": None,
         "shoulder_angle_delta": None,
         "head_offset_delta": None,
+        "head_asym": None,
+        "asym_delta": None,
         "lean_x": None,
         "head_drop": None,
         "head_drop_delta": None,
@@ -237,16 +244,25 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
             metrics["head_offset"] = float(head_offset)
             head_drop = (nose.y - shoulder_mid_y) / shoulder_width
             metrics["head_drop"] = float(head_drop)
+            d_l = math.hypot(nose.x - l_sh.x, nose.y - l_sh.y) / shoulder_width
+            d_r = math.hypot(nose.x - r_sh.x, nose.y - r_sh.y) / shoulder_width
+            asym = d_l - d_r
+            metrics["head_asym"] = float(asym)
             if baseline is not None:
                 head_offset_delta = head_offset - baseline["head_offset"]
+                asym_delta = asym - baseline["head_asym"]
                 lean_x = (shoulder_mid_x - baseline["shoulder_mid_x"]) / shoulder_width
                 head_drop_delta = head_drop - baseline["head_drop"]
                 stand_y_delta = baseline["shoulder_mid_y"] - shoulder_mid_y
                 metrics["head_offset_delta"] = float(head_offset_delta)
+                metrics["asym_delta"] = float(asym_delta)
                 metrics["lean_x"] = float(lean_x)
                 metrics["head_drop_delta"] = float(head_drop_delta)
                 metrics["shoulder_mid_y_delta"] = float(stand_y_delta)
-                signals["TURN"] = abs(head_offset_delta) > TURN_DELTA_THRESH
+                signals["TURN"] = (
+                    abs(head_offset_delta) > TURN_DELTA_THRESH
+                    or abs(asym_delta) > ASYM_TURN_THRESH
+                )
                 signals["LEAN"] = abs(lean_x) > LEAN_X_THRESH
                 signals["HEAD_DOWN"] = head_drop_delta > HEAD_DOWN_THRESH
                 signals["STAND"] = stand_y_delta > STAND_Y_THRESH
@@ -310,7 +326,7 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
     return signals, metrics, reliable_pose
 
 
-def draw_overlay(frame, rois, states):
+def draw_overlay(frame, rois, states, debug_overlay=False):
     colors = {
         "OK": (255, 255, 255),
         "WARN": (0, 255, 255),
@@ -324,22 +340,45 @@ def draw_overlay(frame, rois, states):
         color = colors.get(st.state, (255, 255, 255))
         cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
 
-        signals_txt = " ".join(st.active_signals) if st.active_signals else "-"
-        m = st.last_metrics
+        short = {
+            "TURN": "T",
+            "LEAN": "L",
+            "REACH": "R",
+            "BOUND": "B",
+            "HEAD_DOWN": "D",
+            "STAND": "S",
+            "EMPTY": "E",
+            "ROT": "O",
+        }
+        ordered = [name for name in SIGNAL_NAMES if name in short]
+        sig_items = [short[name] for name in ordered if name in st.active_signals]
+        sig_text = " ".join(sig_items) if sig_items else "-"
+        line1 = f"{sid} {st.state} [{sig_text}] {st.rolling_sum()}/{st.last_points}"
+        cv2.putText(frame, line1, (x + 4, max(12, y + 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
-        def fmt_metric(key, precision):
-            value = m.get(key)
-            if value is None:
-                return "n/a"
-            return f"{float(value):+.{precision}f}"
+        if debug_overlay:
+            m = st.last_metrics
 
-        label = (
-            f"{sid} {st.state} [{signals_txt}] sum={st.rolling_sum()} pts={st.last_points} "
-            f"dH={fmt_metric('head_offset_delta', 2)} lean={fmt_metric('lean_x', 2)} "
-            f"dDrop={fmt_metric('head_drop_delta', 2)} dAng={fmt_metric('shoulder_angle_delta', 1)} "
-            f"dY={fmt_metric('shoulder_mid_y_delta', 2)}"
-        )
-        cv2.putText(frame, label, (x + 4, max(15, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+            def fmt(key):
+                value = m.get(key)
+                if value is None:
+                    return None
+                return f"{float(value):+.2f}"
+
+            line2 = None
+            d_h = fmt("head_offset_delta")
+            d_a = fmt("asym_delta")
+            if d_h is not None and d_a is not None:
+                line2 = f"dH={d_h} a={d_a}"
+            else:
+                lean = fmt("lean_x")
+                drop = fmt("head_drop_delta")
+                if lean is not None and drop is not None:
+                    line2 = f"lean={lean} d={drop}"
+
+            if line2:
+                y2 = min(y + h - 4, max(12, y + 16))
+                cv2.putText(frame, line2, (x + 4, y2), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
 
 
 def print_periodic_summary(rois, states):
@@ -392,6 +431,7 @@ def main():
     states = {roi["id"]: StudentState(roi["id"]) for roi in rois}
     roi_index = 0
     last_print_ts = time.time()
+    debug_overlay = DEBUG_OVERLAY
 
     try:
         while True:
@@ -431,12 +471,14 @@ def main():
 
             if not headless:
                 out = frame.copy()
-                draw_overlay(out, rois, states)
+                draw_overlay(out, rois, states, debug_overlay=debug_overlay)
                 cv2.imshow("Smart Proctor Live", out)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("r"):
                     for s in states.values():
                         s.reset_baseline()
+                if key == ord("d"):
+                    debug_overlay = not debug_overlay
                 if key == 27:
                     break
 
