@@ -326,11 +326,18 @@ def draw_overlay(frame, rois, states):
 
         signals_txt = " ".join(st.active_signals) if st.active_signals else "-"
         m = st.last_metrics
+
+        def fmt_metric(key, precision):
+            value = m.get(key)
+            if value is None:
+                return "n/a"
+            return f"{float(value):+.{precision}f}"
+
         label = (
             f"{sid} {st.state} [{signals_txt}] sum={st.rolling_sum()} pts={st.last_points} "
-            f"dH={m.get('head_offset_delta', 0.0):+.2f} lean={m.get('lean_x', 0.0):+.2f} "
-            f"dDrop={m.get('head_drop_delta', 0.0):+.2f} dAng={m.get('shoulder_angle_delta', 0.0):+.1f} "
-            f"dY={m.get('shoulder_mid_y_delta', 0.0):+.2f}"
+            f"dH={fmt_metric('head_offset_delta', 2)} lean={fmt_metric('lean_x', 2)} "
+            f"dDrop={fmt_metric('head_drop_delta', 2)} dAng={fmt_metric('shoulder_angle_delta', 1)} "
+            f"dY={fmt_metric('shoulder_mid_y_delta', 2)}"
         )
         cv2.putText(frame, label, (x + 4, max(15, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
