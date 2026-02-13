@@ -34,6 +34,8 @@ python -m src.live_proctor --headless
 
 If you run without `--headless` and no display is available, the app auto-falls back to headless mode with a warning.
 
+Baseline calibrates automatically per ROI; in preview mode press `r` to reset/recalibrate baselines (development only).
+
 ## ROI configuration for live mode
 
 Live mode requires exactly two predefined ROIs in `configs/rois_live.json`.
