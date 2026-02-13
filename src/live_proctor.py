@@ -79,13 +79,24 @@ class StudentState:
         ]
         if any(metrics.get(k) is None for k in required):
             return
-        neutral_blockers = STRONG_SIGNALS.union({"TURN", "LEAN", "HEAD_DOWN", "ROT"})
-        if any(signals.get(name, False) for name in neutral_blockers):
+        if any(signals.get(name, False) for name in STRONG_SIGNALS):
             return
         if signals.get("EMPTY", False):
             return
-        current_points = sum(POINTS[name] for name, on in signals.items() if on)
-        if current_points > 1:
+
+        shoulder_width = float(metrics["shoulder_width"])
+        center_lean = 0.0
+        if shoulder_width > 1e-4:
+            center_lean = (float(metrics["shoulder_mid_x"]) - 0.5) / shoulder_width
+
+        neutral_pose_violation = (
+            abs(float(metrics["head_offset"])) > TURN_DELTA_THRESH
+            or abs(float(metrics["head_asym"])) > ASYM_TURN_THRESH
+            or abs(center_lean) > LEAN_X_THRESH
+            or float(metrics["head_drop"]) > HEAD_DOWN_THRESH
+            or abs(float(metrics["shoulder_angle_deg"])) > ROT_DELTA_THRESH
+        )
+        if neutral_pose_violation:
             return
         self.baseline_samples.append({k: float(metrics[k]) for k in required})
         if len(self.baseline_samples) >= BASELINE_SAMPLES:
