@@ -11,17 +11,39 @@ import numpy as np
 from .camera_source import create_camera_source
 from .utils_rois import crop, load_rois
 
-SIGNAL_NAMES = ["TURN", "ROT", "BOUND", "REACH"]
-POINTS = {"TURN": 1, "ROT": 1, "BOUND": 2, "REACH": 3}
+SIGNAL_NAMES = ["TURN", "ROT", "BOUND", "REACH", "LEAN", "HEAD_DOWN", "STAND", "EMPTY"]
+POINTS = {
+    "TURN": 1,
+    "ROT": 0,
+    "BOUND": 2,
+    "REACH": 3,
+    "LEAN": 1,
+    "HEAD_DOWN": 1,
+    "STAND": 3,
+    "EMPTY": 3,
+}
 
 VIS_THRESH = 0.5
-BASELINE_SAMPLES = 20
+BASELINE_SAMPLES = 30
+BASELINE_ALPHA = 0.02
+
+TURN_DELTA_THRESH = 0.20
+LEAN_X_THRESH = 0.50
+HEAD_DOWN_THRESH = 0.15
+STAND_Y_THRESH = 0.12
+ROT_DELTA_THRESH = 15.0
+
 ROLLING_N = 10
 WARN_POINTS = 2
 FLAG_SUM = 10
 FLAG_K = 3
 CLEAR_SUM = 4
-STRONG_SIGNALS = {"BOUND", "REACH"}
+EMPTY_WARN_COUNT = 3
+EMPTY_WARN_N = 6
+EMPTY_FLAG_COUNT = 6
+EMPTY_FLAG_N = 10
+STAND_FLAG_K = 2
+STRONG_SIGNALS = {"BOUND", "REACH", "STAND", "EMPTY"}
 
 
 class StudentState:
@@ -29,46 +51,79 @@ class StudentState:
         self.student_id = student_id
         self.state = "NO_POSE"
         self.baseline_samples = []
-        self.baseline_angle = None
+        self.baseline = None
         self.window = deque(maxlen=ROLLING_N)
         self.active_signals = []
         self.last_points = 0
         self.last_reliable = False
         self.last_metrics = {}
 
-    def add_baseline(self, angle_deg, signals):
-        if self.baseline_angle is not None:
+    def reset_baseline(self):
+        self.baseline_samples = []
+        self.baseline = None
+
+    def add_baseline(self, metrics, signals):
+        if self.baseline is not None:
             return
-        if angle_deg is None:
+        required = [
+            "shoulder_angle_deg",
+            "head_offset",
+            "shoulder_mid_x",
+            "head_drop",
+            "shoulder_width",
+            "shoulder_mid_y",
+        ]
+        if any(metrics.get(k) is None for k in required):
             return
-        if any(signals.values()):
+        if any(signals.get(name, False) for name in STRONG_SIGNALS):
             return
-        self.baseline_samples.append(angle_deg)
+        if signals.get("EMPTY", False):
+            return
+        current_points = sum(POINTS[name] for name, on in signals.items() if on)
+        if current_points > 1:
+            return
+        self.baseline_samples.append({k: float(metrics[k]) for k in required})
         if len(self.baseline_samples) >= BASELINE_SAMPLES:
-            self.baseline_angle = float(np.median(self.baseline_samples))
+            self.baseline = {k: float(np.median([s[k] for s in self.baseline_samples])) for k in required}
+
+    def adapt_baseline(self, metrics, signals):
+        if self.baseline is None:
+            return
+        if self.state != "OK":
+            return
+        if any(signals.get(name, False) for name in STRONG_SIGNALS):
+            return
+        if signals.get("EMPTY", False):
+            return
+        for key in self.baseline.keys():
+            cur = metrics.get(key)
+            if cur is None:
+                return
+        for key in self.baseline.keys():
+            self.baseline[key] = (1.0 - BASELINE_ALPHA) * self.baseline[key] + BASELINE_ALPHA * float(metrics[key])
 
     def update_with_signals(self, signals, metrics):
         points = sum(POINTS[name] for name, on in signals.items() if on)
         self.window.append({"signals": signals.copy(), "points": points})
         self.last_points = points
         self.active_signals = [name for name, on in signals.items() if on]
-        self.last_reliable = True
+        self.last_reliable = bool(metrics.get("reliable_pose", False))
         self.last_metrics = metrics
         self._update_state()
 
     def update_no_pose(self):
+        signals = {name: False for name in SIGNAL_NAMES}
+        signals["EMPTY"] = True
+        metrics = {"reliable_pose": False}
         self.last_reliable = False
-        self.last_points = 0
-        self.active_signals = []
-        self.last_metrics = {}
-        if self.state != "FLAG":
-            self.state = "NO_POSE"
+        self.update_with_signals(signals, metrics)
 
     def rolling_sum(self):
         return int(sum(item["points"] for item in self.window))
 
-    def rolling_count(self, signal_name):
-        return int(sum(1 for item in self.window if item["signals"].get(signal_name, False)))
+    def rolling_count(self, signal_name, n=None):
+        items = self.window if n is None else list(self.window)[-n:]
+        return int(sum(1 for item in items if item["signals"].get(signal_name, False)))
 
     def _update_state(self):
         cur_points = self.last_points
@@ -76,17 +131,31 @@ class StudentState:
         roll_sum = self.rolling_sum()
         reach_count = self.rolling_count("REACH")
         bound_count = self.rolling_count("BOUND")
+        stand_count = self.rolling_count("STAND")
+        empty_warn_count = self.rolling_count("EMPTY", EMPTY_WARN_N)
+        empty_flag_count = self.rolling_count("EMPTY", EMPTY_FLAG_N)
+
+        recent = list(self.window)
+        stand_pattern_count = 0
+        for i in range(1, len(recent)):
+            if recent[i]["signals"].get("EMPTY", False) and recent[i - 1]["signals"].get("BOUND", False):
+                stand_pattern_count += 1
 
         warn = cur_points >= WARN_POINTS or strong_now
         flag = (
             roll_sum >= FLAG_SUM
             or reach_count >= FLAG_K
             or bound_count >= FLAG_K
+            or stand_count >= STAND_FLAG_K
+            or stand_pattern_count >= STAND_FLAG_K
+            or empty_flag_count >= EMPTY_FLAG_COUNT
         )
+        warn = warn or empty_warn_count >= EMPTY_WARN_COUNT or stand_count >= 1 or stand_pattern_count >= 1
 
         if self.state == "FLAG":
-            recent_strong = reach_count > 0 or bound_count > 0
-            if roll_sum < CLEAR_SUM and not recent_strong:
+            recent_strong = reach_count > 0 or bound_count > 0 or stand_count > 0
+            recent_empty = empty_warn_count > 0
+            if roll_sum < CLEAR_SUM and not recent_strong and not recent_empty:
                 self.state = "OK"
             return
 
@@ -123,7 +192,7 @@ def normalize_angle_diff(current, baseline):
     return diff
 
 
-def compute_signals(landmarks, roi, neighbor_roi, baseline_angle):
+def compute_signals(landmarks, roi, neighbor_roi, baseline):
     lm = mp.solutions.pose.PoseLandmark
     nose = landmarks[lm.NOSE]
     l_sh = landmarks[lm.LEFT_SHOULDER]
@@ -141,6 +210,14 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline_angle):
         "head_offset": None,
         "shoulder_angle_deg": None,
         "shoulder_angle_delta": None,
+        "head_offset_delta": None,
+        "lean_x": None,
+        "head_drop": None,
+        "head_drop_delta": None,
+        "shoulder_mid_x": None,
+        "shoulder_mid_y": None,
+        "shoulder_mid_y_delta": None,
+        "shoulder_width": None,
         "reliable_pose": reliable_pose,
     }
 
@@ -151,19 +228,36 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline_angle):
         shoulder_mid_x = (l_sh.x + r_sh.x) / 2.0
         shoulder_mid_y = (l_sh.y + r_sh.y) / 2.0
         shoulder_width = abs(l_sh.x - r_sh.x)
+        metrics["shoulder_mid_x"] = float(shoulder_mid_x)
+        metrics["shoulder_mid_y"] = float(shoulder_mid_y)
+        metrics["shoulder_width"] = float(shoulder_width)
 
         if shoulder_width > 1e-4:
             head_offset = (nose.x - shoulder_mid_x) / shoulder_width
             metrics["head_offset"] = float(head_offset)
-            signals["TURN"] = abs(head_offset) > 0.35
+            head_drop = (nose.y - shoulder_mid_y) / shoulder_width
+            metrics["head_drop"] = float(head_drop)
+            if baseline is not None:
+                head_offset_delta = head_offset - baseline["head_offset"]
+                lean_x = (shoulder_mid_x - baseline["shoulder_mid_x"]) / shoulder_width
+                head_drop_delta = head_drop - baseline["head_drop"]
+                stand_y_delta = baseline["shoulder_mid_y"] - shoulder_mid_y
+                metrics["head_offset_delta"] = float(head_offset_delta)
+                metrics["lean_x"] = float(lean_x)
+                metrics["head_drop_delta"] = float(head_drop_delta)
+                metrics["shoulder_mid_y_delta"] = float(stand_y_delta)
+                signals["TURN"] = abs(head_offset_delta) > TURN_DELTA_THRESH
+                signals["LEAN"] = abs(lean_x) > LEAN_X_THRESH
+                signals["HEAD_DOWN"] = head_drop_delta > HEAD_DOWN_THRESH
+                signals["STAND"] = stand_y_delta > STAND_Y_THRESH
 
         dx = r_sh.x - l_sh.x
         dy = r_sh.y - l_sh.y
         shoulder_angle_deg = math.degrees(math.atan2(dy, dx))
-        angle_delta = normalize_angle_diff(shoulder_angle_deg, baseline_angle)
+        angle_delta = normalize_angle_diff(shoulder_angle_deg, baseline["shoulder_angle_deg"] if baseline else None)
         metrics["shoulder_angle_deg"] = float(shoulder_angle_deg)
         metrics["shoulder_angle_delta"] = float(angle_delta)
-        signals["ROT"] = baseline_angle is not None and abs(angle_delta) > 15.0
+        signals["ROT"] = baseline is not None and abs(angle_delta) > ROT_DELTA_THRESH
 
         margin_x = 0.1 * roi_w
         margin_y = 0.1 * roi_h
@@ -212,6 +306,7 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline_angle):
 
         signals["REACH"] = near_boundary or neighbor_hit
 
+
     return signals, metrics, reliable_pose
 
 
@@ -230,7 +325,13 @@ def draw_overlay(frame, rois, states):
         cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
 
         signals_txt = " ".join(st.active_signals) if st.active_signals else "-"
-        label = f"{sid} {st.state} [{signals_txt}] sum={st.rolling_sum()} pts={st.last_points}"
+        m = st.last_metrics
+        label = (
+            f"{sid} {st.state} [{signals_txt}] sum={st.rolling_sum()} pts={st.last_points} "
+            f"dH={m.get('head_offset_delta', 0.0):+.2f} lean={m.get('lean_x', 0.0):+.2f} "
+            f"dDrop={m.get('head_drop_delta', 0.0):+.2f} dAng={m.get('shoulder_angle_delta', 0.0):+.1f} "
+            f"dY={m.get('shoulder_mid_y_delta', 0.0):+.2f}"
+        )
         cv2.putText(frame, label, (x + 4, max(15, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
 
@@ -307,13 +408,15 @@ def main():
                         result.pose_landmarks.landmark,
                         roi,
                         neighbor_roi,
-                        student.baseline_angle,
+                        student.baseline,
                     )
                     if reliable_pose:
-                        student.add_baseline(metrics.get("shoulder_angle_deg"), signals)
+                        student.add_baseline(metrics, signals)
                         student.update_with_signals(signals, metrics)
+                        student.adapt_baseline(metrics, signals)
                     else:
-                        student.update_no_pose()
+                        signals["EMPTY"] = True
+                        student.update_with_signals(signals, metrics)
                 else:
                     student.update_no_pose()
             else:
@@ -323,7 +426,11 @@ def main():
                 out = frame.copy()
                 draw_overlay(out, rois, states)
                 cv2.imshow("Smart Proctor Live", out)
-                if cv2.waitKey(1) & 0xFF == 27:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("r"):
+                    for s in states.values():
+                        s.reset_baseline()
+                if key == 27:
                     break
 
             now = time.time()
