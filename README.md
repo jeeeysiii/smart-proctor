@@ -101,3 +101,34 @@ How to edit:
 - Performance tuning:
   - Keep `--model-complexity 0`.
   - Use lower resolution/FPS first (`640x360`, `20 FPS`).
+
+## MJPEG camera stream for Cloudflare Tunnel
+
+Run the standalone MJPEG streamer on the Raspberry Pi:
+
+```bash
+python -m src.video_stream_mjpeg --host 0.0.0.0 --port 8000 --width 640 --height 360 --fps 20 --max-fps 15 --jpeg-quality 80 --token YOURTOKEN
+```
+
+Optional camera orientation correction:
+
+```bash
+python -m src.video_stream_mjpeg --flip hv
+```
+
+- Stream endpoint: `http://<pi-ip>:8000/mjpeg`
+- Health endpoint: `http://<pi-ip>:8000/health`
+
+Expose it publicly using Cloudflare Quick Tunnel:
+
+```bash
+cloudflared tunnel --url http://localhost:8000
+```
+
+Embed in the cloud-hosted website:
+
+```html
+<img src="https://<trycloudflare-domain>/mjpeg?token=YOURTOKEN" />
+```
+
+Use HTTPS for the embedded stream when your website is served over HTTPS to avoid mixed-content blocking.
