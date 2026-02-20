@@ -508,9 +508,9 @@ def main():
             student = states[sid]
             current_index = next(i for i, item in enumerate(rois) if item["id"] == sid)
             neighbor_roi = None
-            if current_index + 1 < len(rois):
-                candidate_neighbor = rois[current_index + 1]
-                if candidate_neighbor["id"] in enabled_roi_ids:
+            if len(rois) > 1:
+                candidate_neighbor = rois[(current_index + 1) % len(rois)]
+                if candidate_neighbor["id"] != sid and candidate_neighbor["id"] in enabled_roi_ids:
                     neighbor_roi = candidate_neighbor
             roi_index = (roi_index + 1) % len(enabled_rois)
 
