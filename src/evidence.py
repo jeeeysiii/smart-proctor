@@ -1,6 +1,7 @@
 import json
 import queue
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -68,6 +69,7 @@ class EvidenceWorker(threading.Thread):
                 event_payload["clip_path"] = str(clip_path) if clip_path else None
                 event_payload["snapshot_path"] = str(snap_path) if snap_path else None
                 event_payload.pop("frames", None)
+                event_payload.pop("snapshot", None)
                 self._events.append(event_payload)
                 self._flush_events()
             elif ttype == "mark":
@@ -188,6 +190,12 @@ class EvidenceManager:
         return datetime.fromtimestamp(ts_unix, tz=timezone.utc).isoformat()
 
     def shutdown(self):
+        now_ts = time.time()
+        for runtime in list(self.active_events.values()):
+            if runtime.close_ts is None:
+                runtime.close_ts = now_ts
+            self._finish_event(runtime)
+
         self.worker.submit({"type": "flush"})
         self.worker.shutdown()
 
