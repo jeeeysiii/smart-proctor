@@ -13,7 +13,8 @@ from .utils_rois import crop, load_rois
 
 SIGNAL_NAMES = ["TURN", "ROT", "BOUND", "REACH", "LEAN", "HEAD_DOWN", "STAND", "EMPTY"]
 POINTS = {
-    "TURN": 2,
+    # TURN is still tracked, but weighted lower to reduce minor head-motion penalties.
+    "TURN": 1,
     "ROT": 0,
     "BOUND": 2,
     "REACH": 3,
@@ -27,22 +28,23 @@ VIS_THRESH = 0.5
 BASELINE_SAMPLES = 30
 BASELINE_ALPHA = 0.02
 
-TURN_DELTA_THRESH = 0.20
-TURN_ABS_THRESH = 0.30
+TURN_DELTA_THRESH = 0.30
+TURN_ABS_THRESH = 0.35
 LEAN_X_THRESH = 0.50
 HEAD_DOWN_THRESH = 0.15
 STAND_Y_THRESH = 0.12
 ROT_DELTA_THRESH = 15.0
-ASYM_TURN_THRESH = 0.18
-ASYM_ABS_THRESH = 0.22
+ASYM_TURN_THRESH = 0.24
+ASYM_ABS_THRESH = 0.28
 
 DEBUG_OVERLAY = False
 
 ROLLING_N = 10
-WARN_POINTS = 2
-FLAG_SUM = 10
+WARN_POINTS = 3
+FLAG_SUM = 12
 FLAG_K = 3
-CLEAR_SUM = 4
+# Clear slightly faster once suspicious signals stop.
+CLEAR_SUM = 3
 EMPTY_WARN_COUNT = 3
 EMPTY_WARN_N = 6
 EMPTY_FLAG_COUNT = 6
@@ -133,11 +135,18 @@ class StudentState:
         cur_points = self.last_points
         strong_now = any(name in STRONG_SIGNALS for name in self.active_signals)
         roll_sum = self.rolling_sum()
+        # Require TURN to persist across nearby frames before it can contribute to FLAG.
+        turn_recent = self.rolling_count("TURN", n=5)
         reach_count = self.rolling_count("REACH")
         bound_count = self.rolling_count("BOUND")
         stand_count = self.rolling_count("STAND")
         empty_warn_count = self.rolling_count("EMPTY", EMPTY_WARN_N)
         empty_flag_count = self.rolling_count("EMPTY", EMPTY_FLAG_N)
+
+        roll_sum_for_flag = roll_sum
+        if turn_recent < 2:
+            # Ignore isolated TURN jitter in FLAG accumulation; WARN logic remains unchanged.
+            roll_sum_for_flag -= self.rolling_count("TURN") * POINTS["TURN"]
 
         recent = list(self.window)
         stand_pattern_count = 0
@@ -147,7 +156,7 @@ class StudentState:
 
         warn = cur_points >= WARN_POINTS or strong_now
         flag = (
-            roll_sum >= FLAG_SUM
+            roll_sum_for_flag >= FLAG_SUM
             or reach_count >= FLAG_K
             or bound_count >= FLAG_K
             or stand_count >= STAND_FLAG_K
