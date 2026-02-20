@@ -120,6 +120,11 @@ def parse_args():
     parser.add_argument("--cooldown-seconds", type=float, default=8.0, help="Per-ROI cooldown after event closes")
     parser.add_argument("--camera-device", default=None, help="Optional OpenCV camera device/index override")
     parser.add_argument("--opencv-index", type=int, default=None, help="Explicit OpenCV camera index to try first")
+    parser.add_argument(
+        "--enabled-rois",
+        default="all",
+        help='ROIs to process: "all" (default) or comma-separated ROI ids (e.g. S2 or S1,S3)',
+    )
     return parser.parse_args()
 
 
@@ -231,17 +236,25 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline_angle):
     return signals, metrics, reliable_pose
 
 
-def draw_overlay(frame, rois, states):
+def draw_overlay(frame, rois, states, enabled_roi_ids):
     colors = {
         "OK": (255, 255, 255),
         "WARN": (0, 255, 255),
         "FLAG": (0, 0, 255),
         "NO_POSE": (128, 128, 128),
     }
+    disabled_color = (80, 80, 80)
     for roi in rois:
         sid = roi["id"]
         st = states[sid]
         x, y, w, h = int(roi["x"]), int(roi["y"]), int(roi["w"]), int(roi["h"])
+
+        if sid not in enabled_roi_ids:
+            cv2.rectangle(frame, (x, y), (x + w, y + h), disabled_color, 2)
+            label = f"{sid} DISABLED"
+            cv2.putText(frame, label, (x + 4, max(15, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, disabled_color, 1, cv2.LINE_AA)
+            continue
+
         color = colors.get(st.state, (255, 255, 255))
         cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
 
@@ -250,10 +263,12 @@ def draw_overlay(frame, rois, states):
         cv2.putText(frame, label, (x + 4, max(15, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
 
-def print_periodic_summary(rois, states):
+def print_periodic_summary(rois, states, enabled_roi_ids):
     parts = []
     for roi in rois:
         sid = roi["id"]
+        if sid not in enabled_roi_ids:
+            continue
         st = states[sid]
         sig = ",".join(st.active_signals) if st.active_signals else "-"
         parts.append(f"{sid}:{st.state} sum={st.rolling_sum()} pts={st.last_points} signals={sig}")
@@ -266,7 +281,41 @@ def display_available():
 
 def validate_live_rois(rois):
     if len(rois) != 2:
-        raise ValueError(f"Expected exactly 2 ROIs for live mode, got {len(rois)}")
+        print(f"[WARN] Live mode is typically tuned for 2 ROIs; got {len(rois)}.", flush=True)
+
+
+def resolve_enabled_rois(enabled_rois_arg, rois):
+    valid_ids = [roi["id"] for roi in rois]
+    if enabled_rois_arg.strip().lower() == "all":
+        return valid_ids
+
+    requested = [item.strip() for item in enabled_rois_arg.split(",") if item.strip()]
+    if not requested:
+        raise ValueError(f"--enabled-rois resolved to empty list. Valid ids: {', '.join(valid_ids)}")
+
+    requested_set = set(requested)
+    missing = [sid for sid in requested if sid not in valid_ids]
+    if missing:
+        raise ValueError(
+            f"Unknown ROI ids in --enabled-rois: {', '.join(missing)}. Valid ids: {', '.join(valid_ids)}"
+        )
+
+    enabled = [sid for sid in valid_ids if sid in requested_set]
+    if not enabled:
+        raise ValueError(f"--enabled-rois resolved to empty list. Valid ids: {', '.join(valid_ids)}")
+    return enabled
+
+
+def get_enabled_neighbor_roi(rois, enabled_roi_set, current_sid):
+    for idx, roi in enumerate(rois):
+        if roi["id"] != current_sid:
+            continue
+        if idx + 1 < len(rois):
+            neighbor = rois[idx + 1]
+            if neighbor["id"] in enabled_roi_set:
+                return neighbor
+        return None
+    return None
 
 
 def get_git_commit():
@@ -325,6 +374,9 @@ def main():
     args = parse_args()
     _, rois = load_rois(args.rois)
     validate_live_rois(rois)
+    enabled_roi_ids = resolve_enabled_rois(args.enabled_rois, rois)
+    enabled_roi_set = set(enabled_roi_ids)
+    roi_by_id = {roi["id"]: roi for roi in rois}
 
     headless = args.headless
     if not headless and not display_available():
@@ -351,6 +403,7 @@ def main():
 
     states = {roi["id"]: StudentState(roi["id"]) for roi in rois}
     roi_index = 0
+    enabled_roi_count = len(enabled_roi_ids)
     last_print_ts = time.time()
     frame_idx = 0
 
@@ -379,11 +432,11 @@ def main():
 
             frame_idx += 1
 
-            roi = rois[roi_index]
-            sid = roi["id"]
+            sid = enabled_roi_ids[roi_index]
+            roi = roi_by_id[sid]
             student = states[sid]
-            neighbor_roi = rois[1 - roi_index]
-            roi_index = 1 - roi_index
+            neighbor_roi = get_enabled_neighbor_roi(rois, enabled_roi_set, sid)
+            roi_index = (roi_index + 1) % enabled_roi_count
 
             roi_crop = crop(frame, roi)
             if roi_crop.size > 0:
@@ -407,7 +460,7 @@ def main():
                 student.update_no_pose()
 
             out = frame.copy()
-            draw_overlay(out, rois, states)
+            draw_overlay(out, rois, states, enabled_roi_set)
 
             if evidence is not None:
                 now_ts = time.time()
@@ -461,7 +514,7 @@ def main():
 
             now = time.time()
             if now - last_print_ts >= 1.0:
-                print_periodic_summary(rois, states)
+                print_periodic_summary(rois, states, enabled_roi_set)
                 last_print_ts = now
 
     finally:
