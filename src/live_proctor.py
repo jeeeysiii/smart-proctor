@@ -194,7 +194,34 @@ def parse_args():
     parser.add_argument("--save-evidence", action="store_true", help="Reserved for future evidence saving (currently no-op)")
     parser.add_argument("--camera-device", default=None, help="Optional OpenCV camera device/index override")
     parser.add_argument("--opencv-index", type=int, default=None, help="Explicit OpenCV camera index to try first")
+    parser.add_argument(
+        "--enabled-rois",
+        default="all",
+        help='ROI ids to process: "all" (default) or comma-separated ids (e.g. S2 or S1,S3)',
+    )
+    parser.add_argument("--show-disabled", action="store_true", help="Include disabled ROIs in periodic console summary")
     return parser.parse_args()
+
+
+def resolve_enabled_roi_ids(rois, enabled_rois_arg):
+    roi_ids = [roi["id"] for roi in rois]
+    if enabled_rois_arg.strip().lower() == "all":
+        return set(roi_ids)
+
+    requested_ids = [item.strip() for item in enabled_rois_arg.split(",") if item.strip()]
+    requested_set = set(requested_ids)
+    invalid_ids = sorted([rid for rid in requested_set if rid not in roi_ids])
+    if invalid_ids:
+        valid = ", ".join(roi_ids)
+        invalid = ", ".join(invalid_ids)
+        raise ValueError(f"Unknown ROI id(s): {invalid}. Valid ROI ids: {valid}")
+    if not requested_set:
+        raise ValueError("Enabled ROI list is empty. Use --enabled-rois all or provide at least one ROI id.")
+
+    enabled_in_order = [rid for rid in roi_ids if rid in requested_set]
+    if not enabled_in_order:
+        raise ValueError("Enabled ROI list resolved to empty after validation.")
+    return set(enabled_in_order)
 
 
 def normalize_angle_diff(current, baseline):
@@ -337,7 +364,7 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
     return signals, metrics, reliable_pose
 
 
-def draw_overlay(frame, rois, states, debug_overlay=False):
+def draw_overlay(frame, rois, states, enabled_roi_ids, debug_overlay=False):
     colors = {
         "OK": (255, 255, 255),
         "WARN": (0, 255, 255),
@@ -348,6 +375,22 @@ def draw_overlay(frame, rois, states, debug_overlay=False):
         sid = roi["id"]
         st = states[sid]
         x, y, w, h = int(roi["x"]), int(roi["y"]), int(roi["w"]), int(roi["h"])
+        is_enabled = sid in enabled_roi_ids
+        if not is_enabled:
+            disabled_color = (80, 80, 80)
+            cv2.rectangle(frame, (x, y), (x + w, y + h), disabled_color, 2)
+            cv2.putText(
+                frame,
+                f"{sid} DISABLED",
+                (x + 4, max(12, y + 12)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                disabled_color,
+                1,
+                cv2.LINE_AA,
+            )
+            continue
+
         color = colors.get(st.state, (255, 255, 255))
         cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
 
@@ -392,13 +435,18 @@ def draw_overlay(frame, rois, states, debug_overlay=False):
                 cv2.putText(frame, line2, (x + 4, y2), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
 
 
-def print_periodic_summary(rois, states):
+def print_periodic_summary(rois, states, enabled_roi_ids, show_disabled=False):
     parts = []
     for roi in rois:
         sid = roi["id"]
+        if sid not in enabled_roi_ids and not show_disabled:
+            continue
         st = states[sid]
-        sig = ",".join(st.active_signals) if st.active_signals else "-"
-        parts.append(f"{sid}:{st.state} sum={st.rolling_sum()} pts={st.last_points} signals={sig}")
+        if sid not in enabled_roi_ids:
+            parts.append(f"{sid}:DISABLED")
+        else:
+            sig = ",".join(st.active_signals) if st.active_signals else "-"
+            parts.append(f"{sid}:{st.state} sum={st.rolling_sum()} pts={st.last_points} signals={sig}")
     print(" | ".join(parts), flush=True)
 
 
@@ -407,14 +455,18 @@ def display_available():
 
 
 def validate_live_rois(rois):
+    if len(rois) == 0:
+        raise ValueError("Expected at least 1 ROI for live mode, got 0")
     if len(rois) != 2:
-        raise ValueError(f"Expected exactly 2 ROIs for live mode, got {len(rois)}")
+        print(f"[WARN] Live mode often uses 2 ROIs; got {len(rois)}", flush=True)
 
 
 def main():
     args = parse_args()
     _, rois = load_rois(args.rois)
     validate_live_rois(rois)
+    enabled_roi_ids = resolve_enabled_roi_ids(rois, args.enabled_rois)
+    enabled_rois = [roi for roi in rois if roi["id"] in enabled_roi_ids]
 
     headless = args.headless
     if not headless and not display_available():
@@ -451,11 +503,16 @@ def main():
                 print("[WARN] Camera frame read failed.", flush=True)
                 continue
 
-            roi = rois[roi_index]
+            roi = enabled_rois[roi_index]
             sid = roi["id"]
             student = states[sid]
-            neighbor_roi = rois[1 - roi_index]
-            roi_index = 1 - roi_index
+            current_index = next(i for i, item in enumerate(rois) if item["id"] == sid)
+            neighbor_roi = None
+            if len(rois) > 1:
+                candidate_neighbor = rois[(current_index + 1) % len(rois)]
+                if candidate_neighbor["id"] != sid and candidate_neighbor["id"] in enabled_roi_ids:
+                    neighbor_roi = candidate_neighbor
+            roi_index = (roi_index + 1) % len(enabled_rois)
 
             roi_crop = crop(frame, roi)
             if roi_crop.size > 0:
@@ -482,7 +539,7 @@ def main():
 
             if not headless:
                 out = frame.copy()
-                draw_overlay(out, rois, states, debug_overlay=debug_overlay)
+                draw_overlay(out, rois, states, enabled_roi_ids, debug_overlay=debug_overlay)
                 cv2.imshow("Smart Proctor Live", out)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("r"):
@@ -495,7 +552,7 @@ def main():
 
             now = time.time()
             if now - last_print_ts >= 1.0:
-                print_periodic_summary(rois, states)
+                print_periodic_summary(rois, states, enabled_roi_ids, show_disabled=args.show_disabled)
                 last_print_ts = now
 
     finally:
