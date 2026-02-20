@@ -168,7 +168,8 @@ class StudentState:
         if self.state == "FLAG":
             recent_strong = reach_count > 0 or bound_count > 0 or stand_count > 0
             recent_empty = empty_warn_count > 0
-            if roll_sum < CLEAR_SUM and not recent_strong and not recent_empty:
+            # Apply the same TURN persistence-gated sum here to avoid sticky FLAG from TURN jitter.
+            if roll_sum_for_flag < CLEAR_SUM and not recent_strong and not recent_empty:
                 self.state = "OK"
             return
 
