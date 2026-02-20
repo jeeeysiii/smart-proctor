@@ -1,14 +1,20 @@
 import argparse
+import json
 import math
 import os
+import platform
+import subprocess
 import time
 from collections import deque
+from datetime import datetime
+from pathlib import Path
 
 import cv2
 import mediapipe as mp
 import numpy as np
 
 from .camera_source import create_camera_source
+from .evidence import EvidenceManager
 from .utils_rois import crop, load_rois
 
 SIGNAL_NAMES = ["TURN", "ROT", "BOUND", "REACH"]
@@ -106,7 +112,12 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=20, help="Camera FPS target")
     parser.add_argument("--headless", action="store_true", help="Disable GUI preview")
     parser.add_argument("--model-complexity", type=int, default=0, choices=[0, 1, 2], help="MediaPipe Pose model complexity")
-    parser.add_argument("--save-evidence", action="store_true", help="Reserved for future evidence saving (currently no-op)")
+    parser.add_argument("--save-evidence", action="store_true", help="Enable evidence clips and tuning logs")
+    parser.add_argument("--pre-seconds", type=float, default=5.0, help="Seconds of pre-trigger context for evidence clip")
+    parser.add_argument("--post-seconds", type=float, default=5.0, help="Seconds of post-trigger context for evidence clip")
+    parser.add_argument("--clip-fps", type=int, default=12, help="FPS for saved evidence clips")
+    parser.add_argument("--clear-stable-frames", type=int, default=8, help="Per-ROI stable clear updates required before cooldown")
+    parser.add_argument("--cooldown-seconds", type=float, default=8.0, help="Per-ROI cooldown after event closes")
     parser.add_argument("--camera-device", default=None, help="Optional OpenCV camera device/index override")
     parser.add_argument("--opencv-index", type=int, default=None, help="Explicit OpenCV camera index to try first")
     return parser.parse_args()
@@ -142,6 +153,11 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline_angle):
         "shoulder_angle_deg": None,
         "shoulder_angle_delta": None,
         "reliable_pose": reliable_pose,
+        "vis_nose": float(nose.visibility),
+        "vis_left_shoulder": float(l_sh.visibility),
+        "vis_right_shoulder": float(r_sh.visibility),
+        "vis_left_wrist": float(l_wr.visibility),
+        "vis_right_wrist": float(r_wr.visibility),
     }
 
     roi_w = float(roi["w"])
@@ -253,6 +269,58 @@ def validate_live_rois(rois):
         raise ValueError(f"Expected exactly 2 ROIs for live mode, got {len(rois)}")
 
 
+def get_git_commit():
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        return out or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def create_run_context(args, rois):
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logs_dir = Path("logs")
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    config_path = logs_dir / f"config_{run_id}.json"
+    tunables = {
+        "VIS_THRESH": VIS_THRESH,
+        "BASELINE_SAMPLES": BASELINE_SAMPLES,
+        "ROLLING_N": ROLLING_N,
+        "WARN_POINTS": WARN_POINTS,
+        "FLAG_SUM": FLAG_SUM,
+        "FLAG_K": FLAG_K,
+        "CLEAR_SUM": CLEAR_SUM,
+        "STRONG_SIGNALS": sorted(STRONG_SIGNALS),
+    }
+
+    roi_contents = {}
+    try:
+        with open(args.rois, "r", encoding="utf-8") as fh:
+            roi_contents = json.load(fh)
+    except Exception:
+        roi_contents = {"error": "unable_to_read"}
+
+    config_payload = {
+        "run_id": run_id,
+        "created_at": datetime.now().isoformat(),
+        "tunables": tunables,
+        "cli_args": vars(args),
+        "roi_path": args.rois,
+        "roi_contents": roi_contents,
+        "mediapipe_version": getattr(mp, "__version__", "unknown"),
+        "opencv_version": cv2.__version__,
+        "python_version": platform.python_version(),
+        "git_commit": get_git_commit(),
+        "rois": rois,
+    }
+
+    with open(config_path, "w", encoding="utf-8") as fh:
+        json.dump(config_payload, fh, indent=2)
+
+    return run_id, str(config_path), config_payload["git_commit"]
+
+
 def main():
     args = parse_args()
     _, rois = load_rois(args.rois)
@@ -284,6 +352,23 @@ def main():
     states = {roi["id"]: StudentState(roi["id"]) for roi in rois}
     roi_index = 0
     last_print_ts = time.time()
+    frame_idx = 0
+
+    evidence = None
+    if args.save_evidence:
+        run_id, config_path, git_commit = create_run_context(args, rois)
+        evidence = EvidenceManager(
+            run_id=run_id,
+            log_dir="logs",
+            rois=rois,
+            run_config_path=config_path,
+            git_commit=git_commit,
+            pre_seconds=args.pre_seconds,
+            post_seconds=args.post_seconds,
+            clip_fps=args.clip_fps,
+            clear_stable_frames=args.clear_stable_frames,
+            cooldown_seconds=args.cooldown_seconds,
+        )
 
     try:
         while True:
@@ -291,6 +376,8 @@ def main():
             if not ok or frame is None:
                 print("[WARN] Camera frame read failed.", flush=True)
                 continue
+
+            frame_idx += 1
 
             roi = rois[roi_index]
             sid = roi["id"]
@@ -319,12 +406,58 @@ def main():
             else:
                 student.update_no_pose()
 
+            out = frame.copy()
+            draw_overlay(out, rois, states)
+
+            if evidence is not None:
+                now_ts = time.time()
+                evidence.add_frame(now_ts, out)
+                baseline_ready = student.baseline_angle is not None
+                state = student.state
+                metrics_for_log = student.last_metrics.copy()
+                metrics_for_log["baseline_angle"] = student.baseline_angle
+                metrics_for_log["baseline_samples"] = len(student.baseline_samples)
+
+                payload = {
+                    "type": "ROI_UPDATE",
+                    "ts_wall": datetime.fromtimestamp(now_ts).isoformat(),
+                    "ts_unix": now_ts,
+                    "frame_idx": frame_idx,
+                    "roi_id": sid,
+                    "state": state,
+                    "active_signals": list(student.active_signals),
+                    "points_this_tick": student.last_points,
+                    "rolling_sum": student.rolling_sum(),
+                    "baseline_ready": baseline_ready,
+                    "reliable_pose": student.last_reliable,
+                    "metrics": metrics_for_log,
+                    "visibilities": {
+                        "nose": metrics_for_log.get("vis_nose"),
+                        "left_shoulder": metrics_for_log.get("vis_left_shoulder"),
+                        "right_shoulder": metrics_for_log.get("vis_right_shoulder"),
+                        "left_wrist": metrics_for_log.get("vis_left_wrist"),
+                        "right_wrist": metrics_for_log.get("vis_right_wrist"),
+                    },
+                }
+                evidence.log_roi_update(payload)
+                evidence.handle_roi_state(
+                    ts_unix=now_ts,
+                    frame_idx=frame_idx,
+                    roi_id=sid,
+                    state=state,
+                    active_signals=list(student.active_signals),
+                    rolling_sum=student.rolling_sum(),
+                    metrics=metrics_for_log,
+                    baseline_ready=baseline_ready,
+                )
+
             if not headless:
-                out = frame.copy()
-                draw_overlay(out, rois, states)
                 cv2.imshow("Smart Proctor Live", out)
-                if cv2.waitKey(1) & 0xFF == 27:
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:
                     break
+                if key == ord("m") and evidence is not None:
+                    evidence.mark(time.time())
 
             now = time.time()
             if now - last_print_ts >= 1.0:
@@ -332,6 +465,8 @@ def main():
                 last_print_ts = now
 
     finally:
+        if evidence is not None:
+            evidence.shutdown()
         camera.release()
         pose.close()
         if not headless:
