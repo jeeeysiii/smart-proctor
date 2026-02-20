@@ -36,7 +36,7 @@ If you run without `--headless` and no display is available, the app auto-falls 
 
 ## ROI configuration for live mode
 
-Live mode requires exactly two predefined ROIs in `configs/rois_live.json`.
+Live mode accepts 1..N predefined ROIs (commonly 2 or 4) in `configs/rois_live.json` or another ROI file.
 
 Template shape:
 
@@ -51,17 +51,30 @@ Template shape:
 ```
 
 How to edit:
-- Keep exactly 2 ROI objects.
-- Keep IDs as `S1` and `S2` (recommended for clarity).
+- Keep ROI IDs stable and unique (for example `S1..S4`).
 - Update `x`, `y`, `w`, `h` to match seat positions for your camera view.
 - `frame_size` should match the capture resolution you run with (`--width`, `--height`).
+
+Default 4-seat template: `configs/rois_4_default.json` (640x360, four horizontal slices).
+
+Enable/disable ROI processing without changing the ROI file:
+- Process all ROIs (default):
+  - `python -m src.live_proctor --rois configs/rois_4_default.json`
+- Process only one ROI:
+  - `python -m src.live_proctor --rois configs/rois_4_default.json --enabled-rois S2`
+- Process a subset in ROI-file order:
+  - `python -m src.live_proctor --rois configs/rois_4_default.json --enabled-rois S1,S3`
+
+Notes:
+- Overlay always draws all ROI boxes. Disabled ROIs are shown in gray with `DISABLED` label.
+- Console summary prints enabled ROIs only.
 
 ## What live_proctor does
 
 - Uses libcamera camera feed through:
   - OpenCV `VideoCapture(/dev/video0)` first.
   - Falls back to `picamera2` automatically.
-- Alternates processing one ROI per frame (`S1`, `S2`, `S1`, `S2`, ...).
+- Cycles processing one ROI per frame across enabled IDs in ROI-file order (for 2 ROIs this remains `S1`, `S2`, `S1`, `S2`, ...).
 - Uses `mp.solutions.pose` with low-complexity model for Pi.
 - Computes Layer-2 signals from landmarks:
   - `TURN`: nose offset vs shoulder midpoint normalized by shoulder width.
