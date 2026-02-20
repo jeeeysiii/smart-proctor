@@ -275,8 +275,9 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
             asym = d_l - d_r
             metrics["head_asym"] = float(asym)
             turn_abs = abs(head_offset) > TURN_ABS_THRESH or abs(asym) > ASYM_ABS_THRESH
-            signals["TURN"] = turn_abs
-            if baseline is not None:
+            if baseline is None:
+                signals["TURN"] = turn_abs
+            else:
                 head_offset_delta = head_offset - baseline["head_offset"]
                 asym_delta = asym - baseline["head_asym"]
                 lean_x = (shoulder_mid_x - baseline["shoulder_mid_x"]) / shoulder_width
@@ -291,7 +292,7 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
                     abs(head_offset_delta) > TURN_DELTA_THRESH
                     or abs(asym_delta) > ASYM_TURN_THRESH
                 )
-                signals["TURN"] = turn_abs or turn_delta
+                signals["TURN"] = turn_delta
                 signals["LEAN"] = abs(lean_x) > LEAN_X_THRESH
                 signals["HEAD_DOWN"] = head_drop_delta > HEAD_DOWN_THRESH
                 signals["STAND"] = stand_y_delta > STAND_Y_THRESH
