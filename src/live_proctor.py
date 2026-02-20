@@ -28,11 +28,13 @@ BASELINE_SAMPLES = 30
 BASELINE_ALPHA = 0.02
 
 TURN_DELTA_THRESH = 0.20
+TURN_ABS_THRESH = 0.30
 LEAN_X_THRESH = 0.50
 HEAD_DOWN_THRESH = 0.15
 STAND_Y_THRESH = 0.12
 ROT_DELTA_THRESH = 15.0
 ASYM_TURN_THRESH = 0.18
+ASYM_ABS_THRESH = 0.22
 
 DEBUG_OVERLAY = False
 
@@ -84,20 +86,6 @@ class StudentState:
         if signals.get("EMPTY", False):
             return
 
-        shoulder_width = float(metrics["shoulder_width"])
-        center_lean = 0.0
-        if shoulder_width > 1e-4:
-            center_lean = (float(metrics["shoulder_mid_x"]) - 0.5) / shoulder_width
-
-        neutral_pose_violation = (
-            abs(float(metrics["head_offset"])) > TURN_DELTA_THRESH
-            or abs(float(metrics["head_asym"])) > ASYM_TURN_THRESH
-            or abs(center_lean) > LEAN_X_THRESH
-            or float(metrics["head_drop"]) > HEAD_DOWN_THRESH
-            or abs(float(metrics["shoulder_angle_deg"])) > ROT_DELTA_THRESH
-        )
-        if neutral_pose_violation:
-            return
         self.baseline_samples.append({k: float(metrics[k]) for k in required})
         if len(self.baseline_samples) >= BASELINE_SAMPLES:
             self.baseline = {k: float(np.median([s[k] for s in self.baseline_samples])) for k in required}
@@ -286,6 +274,8 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
             d_r = math.hypot(nose.x - r_sh.x, nose.y - r_sh.y) / shoulder_width
             asym = d_l - d_r
             metrics["head_asym"] = float(asym)
+            turn_abs = abs(head_offset) > TURN_ABS_THRESH or abs(asym) > ASYM_ABS_THRESH
+            signals["TURN"] = turn_abs
             if baseline is not None:
                 head_offset_delta = head_offset - baseline["head_offset"]
                 asym_delta = asym - baseline["head_asym"]
@@ -297,10 +287,11 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
                 metrics["lean_x"] = float(lean_x)
                 metrics["head_drop_delta"] = float(head_drop_delta)
                 metrics["shoulder_mid_y_delta"] = float(stand_y_delta)
-                signals["TURN"] = (
+                turn_delta = (
                     abs(head_offset_delta) > TURN_DELTA_THRESH
                     or abs(asym_delta) > ASYM_TURN_THRESH
                 )
+                signals["TURN"] = turn_abs or turn_delta
                 signals["LEAN"] = abs(lean_x) > LEAN_X_THRESH
                 signals["HEAD_DOWN"] = head_drop_delta > HEAD_DOWN_THRESH
                 signals["STAND"] = stand_y_delta > STAND_Y_THRESH
@@ -446,7 +437,12 @@ def print_periodic_summary(rois, states, enabled_roi_ids, show_disabled=False):
             parts.append(f"{sid}:DISABLED")
         else:
             sig = ",".join(st.active_signals) if st.active_signals else "-"
-            parts.append(f"{sid}:{st.state} sum={st.rolling_sum()} pts={st.last_points} signals={sig}")
+            baseline_count = len(st.baseline_samples)
+            if st.baseline is not None:
+                bl_status = f"BL=READY n={baseline_count}"
+            else:
+                bl_status = f"BL={baseline_count}/{BASELINE_SAMPLES}"
+            parts.append(f"{sid}:{st.state} sum={st.rolling_sum()} pts={st.last_points} signals={sig} {bl_status}")
     print(" | ".join(parts), flush=True)
 
 
