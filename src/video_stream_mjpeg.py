@@ -135,8 +135,15 @@ def build_app(broadcaster: FrameBroadcaster, args):
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
                 )
-
-        return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+        return Response(
+            generate(),
+            mimetype="multipart/x-mixed-replace; boundary=frame",
+            headers={
+                "Access-Control-Allow-Origin": "https://smartproctoring.online",
+                "Access-Control-Allow-Methods": "GET",
+                "Access-Control-Allow-Headers": "*",
+            }
+        )
 
     return app
 
