@@ -307,20 +307,25 @@ def compute_signals(landmarks, roi, neighbor_roi, neighbor_side, baseline):
         metrics["shoulder_mid_y"] = float(shoulder_mid_y)
         metrics["shoulder_width"] = float(shoulder_width)
 
+        head_anchor_xy = None
         if shoulder_width > 1e-4:
             head_x = None
             if nose_reliable:
                 head_x = nose.x
+                head_anchor_xy = (nose.x, nose.y)
                 metrics["head_ref_source"] = "nose"
             elif ears_both_reliable:
                 head_x = (l_ear.x + r_ear.x) / 2.0
+                head_anchor_xy = ((l_ear.x + r_ear.x) / 2.0, (l_ear.y + r_ear.y) / 2.0)
                 metrics["head_ref_source"] = "ears"
             elif ear_one_reliable:
                 if l_ear.visibility >= HEAD_VIS_THRESH:
                     head_x = l_ear.x
+                    head_anchor_xy = (l_ear.x, l_ear.y)
                     metrics["head_ref_source"] = "left_ear"
                 else:
                     head_x = r_ear.x
+                    head_anchor_xy = (r_ear.x, r_ear.y)
                     metrics["head_ref_source"] = "right_ear"
 
             asym = None
@@ -385,7 +390,9 @@ def compute_signals(landmarks, roi, neighbor_roi, neighbor_side, baseline):
 
         margin_x = 0.1 * roi_w
         margin_y = 0.1 * roi_h
-        nose_px = (nose.x * roi_w, nose.y * roi_h)
+        head_anchor_px = None
+        if head_anchor_xy is not None:
+            head_anchor_px = (head_anchor_xy[0] * roi_w, head_anchor_xy[1] * roi_h)
         shoulder_mid_px = (shoulder_mid_x * roi_w, shoulder_mid_y * roi_h)
 
         def outside_safe(pt):
@@ -396,7 +403,8 @@ def compute_signals(landmarks, roi, neighbor_roi, neighbor_side, baseline):
                 or pt[1] > roi_h - margin_y
             )
 
-        signals["BOUND"] = outside_safe(nose_px) or outside_safe(shoulder_mid_px)
+        head_boundary_hit = head_anchor_px is not None and outside_safe(head_anchor_px)
+        signals["BOUND"] = head_boundary_hit or outside_safe(shoulder_mid_px)
 
     if wrist_reliable:
         margin_x = 0.1 * roi_w
