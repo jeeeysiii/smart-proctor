@@ -11,14 +11,13 @@ import numpy as np
 from .camera_source import create_camera_source
 from .utils_rois import crop, load_rois
 
-SIGNAL_NAMES = ["TURN", "ROT", "BOUND", "REACH", "LEAN", "HEAD_DOWN", "STAND", "EMPTY"]
+SIGNAL_NAMES = ["TURN", "ROT", "BOUND", "REACH", "LEAN", "STAND", "EMPTY"]
 POINTS = {
     "TURN": 2,
     "ROT": 0,
     "BOUND": 2,
     "REACH": 3,
     "LEAN": 1,
-    "HEAD_DOWN": 1,
     "STAND": 3,
     "EMPTY": 3,
 }
@@ -31,8 +30,9 @@ BASELINE_ALPHA = 0.02
 
 TURN_DELTA_THRESH = 0.30
 TURN_ABS_THRESH = 0.35
+TILT_REJECT_THRESH = 0.18
+ASYM_YAW_RATIO = 0.6
 LEAN_X_THRESH = 0.50
-HEAD_DOWN_THRESH = 0.15
 STAND_Y_THRESH = 0.12
 ROT_DELTA_THRESH = 15.0
 ASYM_TURN_THRESH = 0.24
@@ -80,7 +80,6 @@ class StudentState:
             "head_offset",
             "head_asym",
             "shoulder_mid_x",
-            "head_drop",
             "shoulder_width",
             "shoulder_mid_y",
         ]
@@ -269,8 +268,8 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
         "head_asym": None,
         "asym_delta": None,
         "lean_x": None,
-        "head_drop": None,
-        "head_drop_delta": None,
+        "ear_vertical_diff_norm": None,
+        "yaw_consistent": None,
         "shoulder_mid_x": None,
         "shoulder_mid_y": None,
         "shoulder_mid_y_delta": None,
@@ -308,8 +307,6 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
 
             asym = None
             if nose_reliable:
-                head_drop = (nose.y - shoulder_mid_y) / shoulder_width
-                metrics["head_drop"] = float(head_drop)
                 d_l = math.hypot(nose.x - l_sh.x, nose.y - l_sh.y) / shoulder_width
                 d_r = math.hypot(nose.x - r_sh.x, nose.y - r_sh.y) / shoulder_width
                 asym = d_l - d_r
@@ -318,22 +315,32 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
             if head_x is not None:
                 head_offset = (head_x - shoulder_mid_x) / shoulder_width
                 metrics["head_offset"] = float(head_offset)
-                turn_abs = abs(head_offset) > TURN_ABS_THRESH
+                ear_vertical_diff_norm = None
+                if l_ear.visibility >= HEAD_VIS_THRESH and r_ear.visibility >= HEAD_VIS_THRESH:
+                    ear_vertical_diff_norm = abs(l_ear.y - r_ear.y) / shoulder_width
+                    metrics["ear_vertical_diff_norm"] = float(ear_vertical_diff_norm)
+
+                yaw_consistent = False
                 if asym is not None:
-                    turn_abs = turn_abs or abs(asym) > ASYM_ABS_THRESH
-                signals["TURN"] = turn_abs
+                    yaw_consistent = abs(asym) > ASYM_YAW_RATIO * abs(head_offset)
+                    metrics["yaw_consistent"] = float(yaw_consistent)
+
+                tilt_reject = False
+                if ear_vertical_diff_norm is not None:
+                    tilt_reject = ear_vertical_diff_norm > TILT_REJECT_THRESH
+
+                turn_abs = abs(head_offset) > TURN_ABS_THRESH
+                signals["TURN"] = turn_abs and yaw_consistent and not tilt_reject
 
             if baseline is not None and nose_reliable and asym is not None and metrics["head_offset"] is not None:
                 head_offset = metrics["head_offset"]
                 head_offset_delta = head_offset - baseline["head_offset"]
                 asym_delta = asym - baseline["head_asym"]
                 lean_x = (shoulder_mid_x - baseline["shoulder_mid_x"]) / shoulder_width
-                head_drop_delta = head_drop - baseline["head_drop"]
                 stand_y_delta = baseline["shoulder_mid_y"] - shoulder_mid_y
                 metrics["head_offset_delta"] = float(head_offset_delta)
                 metrics["asym_delta"] = float(asym_delta)
                 metrics["lean_x"] = float(lean_x)
-                metrics["head_drop_delta"] = float(head_drop_delta)
                 metrics["shoulder_mid_y_delta"] = float(stand_y_delta)
                 turn_delta = (
                     abs(head_offset_delta) > TURN_DELTA_THRESH
@@ -341,7 +348,6 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
                 )
                 signals["TURN"] = signals["TURN"] or turn_delta
                 signals["LEAN"] = abs(lean_x) > LEAN_X_THRESH
-                signals["HEAD_DOWN"] = head_drop_delta > HEAD_DOWN_THRESH
                 signals["STAND"] = stand_y_delta > STAND_Y_THRESH
 
         dx = r_sh.x - l_sh.x
@@ -441,7 +447,6 @@ def draw_overlay(frame, rois, states, enabled_roi_ids, debug_overlay=False):
             "LEAN": "L",
             "REACH": "R",
             "BOUND": "B",
-            "HEAD_DOWN": "D",
             "STAND": "S",
             "EMPTY": "E",
             "ROT": "O",
@@ -468,9 +473,8 @@ def draw_overlay(frame, rois, states, enabled_roi_ids, debug_overlay=False):
                 line2 = f"dH={d_h} a={d_a}"
             else:
                 lean = fmt("lean_x")
-                drop = fmt("head_drop_delta")
-                if lean is not None and drop is not None:
-                    line2 = f"lean={lean} d={drop}"
+                if lean is not None:
+                    line2 = f"lean={lean}"
 
             if line2:
                 y2 = min(y + h - 4, max(12, y + 16))
