@@ -30,12 +30,10 @@ BASELINE_ALPHA = 0.02
 
 TURN_DELTA_THRESH = 0.30
 TURN_ABS_THRESH = 0.35
-# Tilt rejection (ear vertical difference normalized by shoulder width)
-TILT_REJECT_THRESH = 0.13
-
-# Ear horizontal span cue for yaw (normalized by shoulder width).
-# Yaw tends to reduce apparent ear-to-ear horizontal span compared to frontal/tilt.
-EAR_DX_YAW_THRESH = 0.60
+# Ear-based yaw vs tilt discrimination (normalized by shoulder_width)
+EAR_DY_TILT_REJECT = 0.12   # roll/tilt evidence
+EAR_DZ_YAW_MIN = 0.08       # yaw evidence (depth difference between ears)
+EAR_DZ_STRONG = 0.12        # optional: stronger yaw evidence (for tuning/logs)
 
 # When nose is not usable but both ears are, require slightly stronger head_offset to avoid tilt FP.
 TURN_STRONG_EARS_ONLY = 0.42
@@ -277,8 +275,8 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
         "head_asym": None,
         "asym_delta": None,
         "lean_x": None,
-        "ear_vertical_diff_norm": None,
-        "ear_dx_norm": None,
+        "ear_dy_norm": None,
+        "ear_dz_norm": None,
         "yaw_consistent": None,
         "shoulder_mid_x": None,
         "shoulder_mid_y": None,
@@ -323,26 +321,25 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
             if head_x is not None:
                 head_offset = (head_x - shoulder_mid_x) / shoulder_width
                 metrics["head_offset"] = float(head_offset)
-                ear_vertical_diff_norm = None
-                ear_dx_norm = None
+                ear_dy_norm = None
+                ear_dz_norm = None
+                tilt_reject = False
                 ears_both = l_ear.visibility >= HEAD_VIS_THRESH and r_ear.visibility >= HEAD_VIS_THRESH
                 if ears_both:
-                    ear_vertical_diff_norm = abs(l_ear.y - r_ear.y) / shoulder_width
-                    ear_dx_norm = abs(l_ear.x - r_ear.x) / shoulder_width
-                    metrics["ear_vertical_diff_norm"] = float(ear_vertical_diff_norm)
-                    metrics["ear_dx_norm"] = float(ear_dx_norm)
+                    ear_dy_norm = abs(l_ear.y - r_ear.y) / shoulder_width
+                    ear_dz_norm = abs(l_ear.z - r_ear.z) / shoulder_width
+                    metrics["ear_dy_norm"] = float(ear_dy_norm)
+                    metrics["ear_dz_norm"] = float(ear_dz_norm)
 
-                tilt_reject = False
-                if ear_vertical_diff_norm is not None:
-                    tilt_reject = ear_vertical_diff_norm > TILT_REJECT_THRESH
+                if ear_dy_norm is not None and ear_dz_norm is not None:
+                    # Reject only when it looks like roll: ears vertically misaligned but not depth-separated.
+                    tilt_reject = (ear_dy_norm > EAR_DY_TILT_REJECT) and (ear_dz_norm < EAR_DZ_YAW_MIN)
 
                 if nose_reliable and asym is not None:
                     yaw_consistent = abs(asym) > ASYM_YAW_RATIO * abs(head_offset)
                     turn_abs = abs(head_offset) > TURN_ABS_THRESH
                 elif ears_both_reliable:
-                    yaw_consistent = False
-                    if ear_dx_norm is not None:
-                        yaw_consistent = ear_dx_norm < EAR_DX_YAW_THRESH
+                    yaw_consistent = (ear_dz_norm is not None) and (ear_dz_norm > EAR_DZ_YAW_MIN)
                     turn_abs = abs(head_offset) > TURN_STRONG_EARS_ONLY
                 else:
                     yaw_consistent = False
@@ -365,7 +362,8 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
                     abs(head_offset_delta) > TURN_DELTA_THRESH
                     or abs(asym_delta) > ASYM_TURN_THRESH
                 )
-                signals["TURN"] = signals["TURN"] or turn_delta
+                if not tilt_reject:
+                    signals["TURN"] = signals["TURN"] or turn_delta
                 signals["LEAN"] = abs(lean_x) > LEAN_X_THRESH
                 signals["STAND"] = stand_y_delta > STAND_Y_THRESH
 
