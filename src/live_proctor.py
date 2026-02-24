@@ -146,7 +146,15 @@ class StudentState:
         stand_count = self.rolling_count("STAND")
         empty_warn_count = self.rolling_count("EMPTY", EMPTY_WARN_N)
         empty_flag_count = self.rolling_count("EMPTY", EMPTY_FLAG_N)
-        roll_sum_for_flag = roll_sum
+        if turn_flag:
+            roll_sum_for_flag = roll_sum
+        else:
+            roll_sum_for_flag = int(
+                sum(
+                    item["points"] - (POINTS["TURN"] if item["signals"].get("TURN", False) else 0)
+                    for item in self.window
+                )
+            )
 
         recent = list(self.window)
         stand_pattern_count = 0
