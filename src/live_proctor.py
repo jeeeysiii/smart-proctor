@@ -320,10 +320,10 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
                     ear_vertical_diff_norm = abs(l_ear.y - r_ear.y) / shoulder_width
                     metrics["ear_vertical_diff_norm"] = float(ear_vertical_diff_norm)
 
-                yaw_consistent = False
+                yaw_consistent = True
                 if asym is not None:
                     yaw_consistent = abs(asym) > ASYM_YAW_RATIO * abs(head_offset)
-                    metrics["yaw_consistent"] = float(yaw_consistent)
+                metrics["yaw_consistent"] = float(yaw_consistent)
 
                 tilt_reject = False
                 if ear_vertical_diff_norm is not None:
