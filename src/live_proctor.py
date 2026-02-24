@@ -30,7 +30,16 @@ BASELINE_ALPHA = 0.02
 
 TURN_DELTA_THRESH = 0.30
 TURN_ABS_THRESH = 0.35
-TILT_REJECT_THRESH = 0.18
+# Tilt rejection (ear vertical difference normalized by shoulder width)
+TILT_REJECT_THRESH = 0.13
+
+# Ear horizontal span cue for yaw (normalized by shoulder width).
+# Yaw tends to reduce apparent ear-to-ear horizontal span compared to frontal/tilt.
+EAR_DX_YAW_THRESH = 0.60
+
+# When nose is not usable but both ears are, require slightly stronger head_offset to avoid tilt FP.
+TURN_STRONG_EARS_ONLY = 0.42
+
 ASYM_YAW_RATIO = 0.6
 LEAN_X_THRESH = 0.50
 STAND_Y_THRESH = 0.12
@@ -269,6 +278,7 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
         "asym_delta": None,
         "lean_x": None,
         "ear_vertical_diff_norm": None,
+        "ear_dx_norm": None,
         "yaw_consistent": None,
         "shoulder_mid_x": None,
         "shoulder_mid_y": None,
@@ -297,13 +307,6 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
             elif ears_both_reliable:
                 head_x = (l_ear.x + r_ear.x) / 2.0
                 head_anchor_xy = ((l_ear.x + r_ear.x) / 2.0, (l_ear.y + r_ear.y) / 2.0)
-            elif ear_one_reliable:
-                if l_ear.visibility >= HEAD_VIS_THRESH:
-                    head_x = l_ear.x
-                    head_anchor_xy = (l_ear.x, l_ear.y)
-                else:
-                    head_x = r_ear.x
-                    head_anchor_xy = (r_ear.x, r_ear.y)
 
             asym = None
             if nose_reliable:
@@ -316,20 +319,31 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
                 head_offset = (head_x - shoulder_mid_x) / shoulder_width
                 metrics["head_offset"] = float(head_offset)
                 ear_vertical_diff_norm = None
-                if l_ear.visibility >= HEAD_VIS_THRESH and r_ear.visibility >= HEAD_VIS_THRESH:
+                ear_dx_norm = None
+                ears_both = l_ear.visibility >= HEAD_VIS_THRESH and r_ear.visibility >= HEAD_VIS_THRESH
+                if ears_both:
                     ear_vertical_diff_norm = abs(l_ear.y - r_ear.y) / shoulder_width
+                    ear_dx_norm = abs(l_ear.x - r_ear.x) / shoulder_width
                     metrics["ear_vertical_diff_norm"] = float(ear_vertical_diff_norm)
-
-                yaw_consistent = True
-                if asym is not None:
-                    yaw_consistent = abs(asym) > ASYM_YAW_RATIO * abs(head_offset)
-                metrics["yaw_consistent"] = float(yaw_consistent)
+                    metrics["ear_dx_norm"] = float(ear_dx_norm)
 
                 tilt_reject = False
                 if ear_vertical_diff_norm is not None:
                     tilt_reject = ear_vertical_diff_norm > TILT_REJECT_THRESH
 
-                turn_abs = abs(head_offset) > TURN_ABS_THRESH
+                if nose_reliable and asym is not None:
+                    yaw_consistent = abs(asym) > ASYM_YAW_RATIO * abs(head_offset)
+                    turn_abs = abs(head_offset) > TURN_ABS_THRESH
+                elif ears_both_reliable:
+                    yaw_consistent = False
+                    if ear_dx_norm is not None:
+                        yaw_consistent = ear_dx_norm < EAR_DX_YAW_THRESH
+                    turn_abs = abs(head_offset) > TURN_STRONG_EARS_ONLY
+                else:
+                    yaw_consistent = False
+                    turn_abs = False
+
+                metrics["yaw_consistent"] = float(yaw_consistent)
                 signals["TURN"] = turn_abs and yaw_consistent and not tilt_reject
 
             if baseline is not None and nose_reliable and asym is not None and metrics["head_offset"] is not None:
