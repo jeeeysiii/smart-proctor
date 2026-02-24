@@ -307,6 +307,11 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
             elif ears_both_reliable:
                 head_x = (l_ear.x + r_ear.x) / 2.0
                 head_anchor_xy = ((l_ear.x + r_ear.x) / 2.0, (l_ear.y + r_ear.y) / 2.0)
+            elif ear_one_reliable:
+                if l_ear.visibility >= HEAD_VIS_THRESH:
+                    head_anchor_xy = (l_ear.x, l_ear.y)
+                else:
+                    head_anchor_xy = (r_ear.x, r_ear.y)
 
             asym = None
             if nose_reliable:
