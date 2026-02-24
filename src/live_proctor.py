@@ -11,11 +11,9 @@ import numpy as np
 from .camera_source import create_camera_source
 from .utils_rois import crop, load_rois
 
-SIGNAL_NAMES = ["TURN", "TTN", "ROT", "BOUND", "REACH", "LEAN", "HEAD_DOWN", "STAND", "EMPTY"]
+SIGNAL_NAMES = ["TURN", "ROT", "BOUND", "REACH", "LEAN", "HEAD_DOWN", "STAND", "EMPTY"]
 POINTS = {
-    # TURN is still tracked, but weighted lower to reduce minor head-motion penalties.
-    "TURN": 1,
-    "TTN": 3,
+    "TURN": 2,
     "ROT": 0,
     "BOUND": 2,
     "REACH": 3,
@@ -28,7 +26,6 @@ POINTS = {
 VIS_THRESH = 0.5
 SHOULDER_VIS_THRESH = 0.50
 HEAD_VIS_THRESH = 0.30
-HIP_VIS_THRESH = 0.35
 BASELINE_SAMPLES = 30
 BASELINE_ALPHA = 0.02
 
@@ -40,13 +37,8 @@ STAND_Y_THRESH = 0.12
 ROT_DELTA_THRESH = 15.0
 ASYM_TURN_THRESH = 0.24
 ASYM_ABS_THRESH = 0.28
-TTN_HEAD_TOWARD_THRESH = 0.25
-TTN_HEAD_STRONG_THRESH = 0.35
-TORSO_SUPPORT_THRESH = 0.12
-TTN_WARN_N = 3
-TTN_WARN_COUNT = 2
-TTN_FLAG_N = 4
-TTN_FLAG_COUNT = 3
+TURN_FLAG_N = 4
+TURN_FLAG_COUNT = 3
 
 DEBUG_OVERLAY = False
 
@@ -112,7 +104,7 @@ class StudentState:
             return
         if signals.get("EMPTY", False):
             return
-        if signals.get("TURN", False) or signals.get("TTN", False) or signals.get("ROT", False):
+        if signals.get("TURN", False) or signals.get("ROT", False):
             return
         for key in self.baseline.keys():
             cur = metrics.get(key)
@@ -148,20 +140,21 @@ class StudentState:
         cur_points = self.last_points
         strong_now = any(name in STRONG_SIGNALS for name in self.active_signals)
         roll_sum = self.rolling_sum()
-        # Require TURN to persist across nearby frames before it can contribute to FLAG.
-        turn_recent = self.rolling_count("TURN", n=5)
+        turn_flag = self.rolling_count("TURN", n=TURN_FLAG_N) >= TURN_FLAG_COUNT
         reach_count = self.rolling_count("REACH")
         bound_count = self.rolling_count("BOUND")
         stand_count = self.rolling_count("STAND")
         empty_warn_count = self.rolling_count("EMPTY", EMPTY_WARN_N)
         empty_flag_count = self.rolling_count("EMPTY", EMPTY_FLAG_N)
-        ttn_warn = self.rolling_count("TTN", TTN_WARN_N) >= TTN_WARN_COUNT
-        ttn_flag = self.rolling_count("TTN", TTN_FLAG_N) >= TTN_FLAG_COUNT
-
-        roll_sum_for_flag = roll_sum
-        if turn_recent < 2:
-            # Ignore isolated TURN jitter in FLAG accumulation; WARN logic remains unchanged.
-            roll_sum_for_flag -= self.rolling_count("TURN") * POINTS["TURN"]
+        if turn_flag:
+            roll_sum_for_flag = roll_sum
+        else:
+            roll_sum_for_flag = int(
+                sum(
+                    item["points"] - (POINTS["TURN"] if item["signals"].get("TURN", False) else 0)
+                    for item in self.window
+                )
+            )
 
         recent = list(self.window)
         stand_pattern_count = 0
@@ -177,15 +170,15 @@ class StudentState:
             or stand_count >= STAND_FLAG_K
             or stand_pattern_count >= STAND_FLAG_K
             or empty_flag_count >= EMPTY_FLAG_COUNT
-            or ttn_flag
+            or turn_flag
         )
-        warn = warn or empty_warn_count >= EMPTY_WARN_COUNT or stand_count >= 1 or stand_pattern_count >= 1 or ttn_warn
+        warn = warn or empty_warn_count >= EMPTY_WARN_COUNT or stand_count >= 1 or stand_pattern_count >= 1
 
         if self.state == "FLAG":
             recent_strong = reach_count > 0 or bound_count > 0 or stand_count > 0
             recent_empty = empty_warn_count > 0
-            # Apply the same TURN persistence-gated sum here to avoid sticky FLAG from TURN jitter.
-            if roll_sum_for_flag < CLEAR_SUM and not recent_strong and not recent_empty:
+            turn_flag = self.rolling_count("TURN", n=TURN_FLAG_N) >= TURN_FLAG_COUNT
+            if roll_sum_for_flag < CLEAR_SUM and not recent_strong and not recent_empty and not turn_flag:
                 self.state = "OK"
             return
 
@@ -249,7 +242,7 @@ def normalize_angle_diff(current, baseline):
     return diff
 
 
-def compute_signals(landmarks, roi, neighbor_roi, neighbor_side, baseline):
+def compute_signals(landmarks, roi, neighbor_roi, baseline):
     lm = mp.solutions.pose.PoseLandmark
     nose = landmarks[lm.NOSE]
     l_sh = landmarks[lm.LEFT_SHOULDER]
@@ -258,14 +251,11 @@ def compute_signals(landmarks, roi, neighbor_roi, neighbor_side, baseline):
     r_wr = landmarks[lm.RIGHT_WRIST]
     l_ear = landmarks[lm.LEFT_EAR]
     r_ear = landmarks[lm.RIGHT_EAR]
-    l_hip = landmarks[lm.LEFT_HIP]
-    r_hip = landmarks[lm.RIGHT_HIP]
 
     shoulders_reliable = l_sh.visibility >= SHOULDER_VIS_THRESH and r_sh.visibility >= SHOULDER_VIS_THRESH
     nose_reliable = nose.visibility >= HEAD_VIS_THRESH
     ears_both_reliable = l_ear.visibility >= HEAD_VIS_THRESH and r_ear.visibility >= HEAD_VIS_THRESH
     ear_one_reliable = (l_ear.visibility >= HEAD_VIS_THRESH) ^ (r_ear.visibility >= HEAD_VIS_THRESH)
-    hips_reliable = l_hip.visibility >= HIP_VIS_THRESH and r_hip.visibility >= HIP_VIS_THRESH
     wrist_reliable = l_wr.visibility >= VIS_THRESH or r_wr.visibility >= VIS_THRESH
     head_anchor_reliable = nose_reliable or ears_both_reliable or ear_one_reliable
     reliable_pose = shoulders_reliable and head_anchor_reliable
@@ -281,14 +271,6 @@ def compute_signals(landmarks, roi, neighbor_roi, neighbor_side, baseline):
         "lean_x": None,
         "head_drop": None,
         "head_drop_delta": None,
-        "toward_score": None,
-        "torso_offset": None,
-        "head_ref_source": "none",
-        "neighbor_side": int(neighbor_side),
-        "l_ear_vis": float(l_ear.visibility),
-        "r_ear_vis": float(r_ear.visibility),
-        "l_hip_vis": float(l_hip.visibility),
-        "r_hip_vis": float(r_hip.visibility),
         "shoulder_mid_x": None,
         "shoulder_mid_y": None,
         "shoulder_mid_y_delta": None,
@@ -313,20 +295,16 @@ def compute_signals(landmarks, roi, neighbor_roi, neighbor_side, baseline):
             if nose_reliable:
                 head_x = nose.x
                 head_anchor_xy = (nose.x, nose.y)
-                metrics["head_ref_source"] = "nose"
             elif ears_both_reliable:
                 head_x = (l_ear.x + r_ear.x) / 2.0
                 head_anchor_xy = ((l_ear.x + r_ear.x) / 2.0, (l_ear.y + r_ear.y) / 2.0)
-                metrics["head_ref_source"] = "ears"
             elif ear_one_reliable:
                 if l_ear.visibility >= HEAD_VIS_THRESH:
                     head_x = l_ear.x
                     head_anchor_xy = (l_ear.x, l_ear.y)
-                    metrics["head_ref_source"] = "left_ear"
                 else:
                     head_x = r_ear.x
                     head_anchor_xy = (r_ear.x, r_ear.y)
-                    metrics["head_ref_source"] = "right_ear"
 
             asym = None
             if nose_reliable:
@@ -344,20 +322,6 @@ def compute_signals(landmarks, roi, neighbor_roi, neighbor_side, baseline):
                 if asym is not None:
                     turn_abs = turn_abs or abs(asym) > ASYM_ABS_THRESH
                 signals["TURN"] = turn_abs
-
-                toward_score = head_offset * float(neighbor_side)
-                metrics["toward_score"] = float(toward_score)
-                if neighbor_side != 0:
-                    head_toward = toward_score > TTN_HEAD_TOWARD_THRESH
-                    head_strong = toward_score > TTN_HEAD_STRONG_THRESH
-                    asym_support = asym is not None and toward_score > 0 and abs(asym) > ASYM_TURN_THRESH
-                    torso_support = False
-                    if hips_reliable:
-                        hip_mid_x = (l_hip.x + r_hip.x) / 2.0
-                        torso_offset = (shoulder_mid_x - hip_mid_x) / shoulder_width
-                        metrics["torso_offset"] = float(torso_offset)
-                        torso_support = abs(torso_offset) > TORSO_SUPPORT_THRESH
-                    signals["TTN"] = head_toward and (head_strong or torso_support or asym_support or ear_one_reliable)
 
             if baseline is not None and nose_reliable and asym is not None and metrics["head_offset"] is not None:
                 head_offset = metrics["head_offset"]
@@ -474,7 +438,6 @@ def draw_overlay(frame, rois, states, enabled_roi_ids, debug_overlay=False):
 
         short = {
             "TURN": "T",
-            "TTN": "TN",
             "LEAN": "L",
             "REACH": "R",
             "BOUND": "B",
@@ -501,13 +464,7 @@ def draw_overlay(frame, rois, states, enabled_roi_ids, debug_overlay=False):
             line2 = None
             d_h = fmt("head_offset_delta")
             d_a = fmt("asym_delta")
-            toward = fmt("toward_score")
-            if toward is not None:
-                src = str(m.get("head_ref_source", "none"))
-                l_ear = fmt("l_ear_vis") or "na"
-                r_ear = fmt("r_ear_vis") or "na"
-                line2 = f"to={toward} src={src} e={l_ear}/{r_ear}"
-            elif d_h is not None and d_a is not None:
+            if d_h is not None and d_a is not None:
                 line2 = f"dH={d_h} a={d_a}"
             else:
                 lean = fmt("lean_x")
@@ -536,11 +493,7 @@ def print_periodic_summary(rois, states, enabled_roi_ids, show_disabled=False):
                 bl_status = f"BL=READY n={baseline_count}"
             else:
                 bl_status = f"BL={baseline_count}/{BASELINE_SAMPLES}"
-            toward_score = st.last_metrics.get("toward_score")
-            toward_txt = ""
-            if toward_score is not None:
-                toward_txt = f" toward={toward_score:+.2f}"
-            parts.append(f"{sid}:{st.state} sum={st.rolling_sum()} pts={st.last_points} signals={sig} {bl_status}{toward_txt}")
+            parts.append(f"{sid}:{st.state} sum={st.rolling_sum()} pts={st.last_points} signals={sig} {bl_status}")
     print(" | ".join(parts), flush=True)
 
 
@@ -602,14 +555,10 @@ def main():
             student = states[sid]
             current_index = next(i for i, item in enumerate(rois) if item["id"] == sid)
             neighbor_roi = None
-            neighbor_side = 0
             if len(rois) > 1:
                 candidate_neighbor = rois[(current_index + 1) % len(rois)]
                 if candidate_neighbor["id"] != sid and candidate_neighbor["id"] in enabled_roi_ids:
                     neighbor_roi = candidate_neighbor
-                    cur_cx = float(roi["x"]) + float(roi["w"]) / 2.0
-                    nbr_cx = float(neighbor_roi["x"]) + float(neighbor_roi["w"]) / 2.0
-                    neighbor_side = 1 if nbr_cx > cur_cx else -1
             roi_index = (roi_index + 1) % len(enabled_rois)
 
             roi_crop = crop(frame, roi)
@@ -621,7 +570,6 @@ def main():
                         result.pose_landmarks.landmark,
                         roi,
                         neighbor_roi,
-                        neighbor_side,
                         student.baseline,
                     )
                     if reliable_pose:
