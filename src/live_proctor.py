@@ -193,9 +193,9 @@ class StudentState:
 
 
 class EvidenceManager:
-    def __init__(self, student_ids, fps):
-        self.fps = int(fps)
-        self.frame_buffer = deque(maxlen=PRE_EVENT_SEC * self.fps)
+    def __init__(self, student_ids, camera_fps=None, evidence_fps=EVIDENCE_FPS):
+        self.fps = int(evidence_fps)
+        self.frame_buffer = deque(maxlen=max(1, int(PRE_EVENT_SEC * max(1, camera_fps or self.fps))))
         self.latest_frame = None
         self.events = {}
         for student_id in student_ids:
@@ -208,16 +208,22 @@ class EvidenceManager:
                 "clip_file": None,
                 "signals": set(),
                 "frame_count": 0,
+                "last_write_time": None,
             }
         os.makedirs(EVIDENCE_DIR, exist_ok=True)
         log_dir = os.path.dirname(LOG_FILE)
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
 
-    def update_frame(self, frame):
+    def update_frame(self, frame, timestamp):
         frame_copy = frame.copy()
         self.latest_frame = frame_copy
-        self.frame_buffer.append(frame_copy)
+        self.frame_buffer.append((timestamp, frame_copy))
+
+    def _should_write(self, event, now):
+        if event["last_write_time"] is None:
+            return True
+        return (now - event["last_write_time"]) >= (1.0 / self.fps)
 
     def update_student(self, student_id, signals, timestamp):
         suspicious = any(signals.get(s, False) for s in ["LEAN", "ROT", "REACH", "BOUND", "STAND"])
@@ -243,9 +249,18 @@ class EvidenceManager:
             event["clip_file"] = clip_file
             event["signals"] = {s for s, enabled in signals.items() if enabled}
 
-            for buffered_frame in self.frame_buffer:
+            cutoff = timestamp - PRE_EVENT_SEC
+            last_written_ts = None
+            for ts, buffered_frame in self.frame_buffer:
+                if ts < cutoff:
+                    continue
+                if last_written_ts is not None and (ts - last_written_ts) < (1.0 / self.fps):
+                    continue
                 writer.write(buffered_frame)
-            event["frame_count"] = len(self.frame_buffer)
+                last_written_ts = ts
+                event["frame_count"] += 1
+
+            event["last_write_time"] = last_written_ts if last_written_ts is not None else timestamp
 
         elif event["active"]:
             if suspicious:
@@ -260,8 +275,10 @@ class EvidenceManager:
             if not event["active"]:
                 continue
 
-            event["writer"].write(self.latest_frame)
-            event["frame_count"] += 1
+            if self._should_write(event, timestamp):
+                event["writer"].write(self.latest_frame)
+                event["frame_count"] += 1
+                event["last_write_time"] = timestamp
 
             if not event["suspicious"] and (timestamp - event["last_motion_time"] > POST_SILENCE_SEC):
                 self._close_event(student_id, timestamp)
@@ -279,6 +296,7 @@ class EvidenceManager:
             "signals": sorted(event["signals"]),
             "clip_file": event["clip_file"],
             "duration_sec": duration,
+            "fps": self.fps,
         }
         with open(LOG_FILE, "a") as f:
             f.write(json.dumps(entry) + "\n")
@@ -291,6 +309,7 @@ class EvidenceManager:
         event["clip_file"] = None
         event["signals"] = set()
         event["frame_count"] = 0
+        event["last_write_time"] = None
 
     def close_all(self, timestamp):
         for student_id in self.events.keys():
@@ -595,7 +614,7 @@ def main():
     )
 
     states = {roi["id"]: StudentState(roi["id"]) for roi in rois}
-    evidence = EvidenceManager(student_ids=list(states.keys()), fps=args.fps)
+    evidence = EvidenceManager(student_ids=list(states.keys()), camera_fps=args.fps, evidence_fps=EVIDENCE_FPS)
     roi_index = 0
     last_print_ts = time.time()
     debug_overlay = DEBUG_OVERLAY
@@ -607,7 +626,8 @@ def main():
                 print("[WARN] Camera frame read failed.", flush=True)
                 continue
 
-            evidence.update_frame(frame)
+            now_ts = time.time()
+            evidence.update_frame(frame, now_ts)
 
             roi = enabled_rois[roi_index]
             sid = roi["id"]
@@ -643,7 +663,6 @@ def main():
             else:
                 student.update_no_pose()
 
-            now_ts = time.time()
             evidence.update_student(sid, student.window[-1]["signals"], now_ts)
             evidence.write_active_events(now_ts)
 
