@@ -2,6 +2,8 @@ import argparse
 import json
 import math
 import os
+import queue
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -351,12 +353,34 @@ class EvidenceManager:
 
 
 class EventAPIClient:
-    def __init__(self, url, mode="json", timeout=2.0):
+    def __init__(self, url, mode="json", timeout=2.0, max_queue_size=1000):
         self.url = url
         self.mode = mode if mode in {"json", "form"} else "json"
         self.timeout = float(timeout)
+        self.queue = queue.Queue(maxsize=max_queue_size)
+        self._stop_sentinel = object()
+        self._worker = threading.Thread(target=self._upload_worker, daemon=True)
+        self._worker.start()
 
     def send_event(self, entry: dict) -> bool:
+        try:
+            self.queue.put_nowait(entry)
+            return True
+        except queue.Full:
+            print("[WARN] Event upload queue is full; dropping event upload.", flush=True)
+            return False
+
+    def _upload_worker(self):
+        while True:
+            item = self.queue.get()
+            try:
+                if item is self._stop_sentinel:
+                    return
+                self._send_event_sync(item)
+            finally:
+                self.queue.task_done()
+
+    def _send_event_sync(self, entry: dict) -> bool:
         try:
             if self.mode == "form":
                 body = urllib.parse.urlencode({"event": json.dumps(entry)}).encode("utf-8")
@@ -371,6 +395,12 @@ class EventAPIClient:
         except Exception as exc:
             print(f"[WARN] Event log POST failed: {exc}", flush=True)
             return False
+
+    def close(self):
+        self.queue.put(self._stop_sentinel)
+        self._worker.join(timeout=self.timeout)
+        if self._worker.is_alive():
+            print("[WARN] Event upload worker did not stop cleanly.", flush=True)
 
 
 def parse_args():
@@ -764,6 +794,8 @@ def main():
 
     finally:
         evidence.close_all(time.time())
+        if api_client is not None:
+            api_client.close()
         camera.release()
         pose.close()
         if not headless:
