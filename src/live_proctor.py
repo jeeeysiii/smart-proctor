@@ -2,7 +2,12 @@ import argparse
 import json
 import math
 import os
+import queue
+import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import deque
 from datetime import datetime, timezone
 
@@ -62,7 +67,7 @@ PRE_EVENT_SEC = 3
 POST_SILENCE_SEC = 3
 EVIDENCE_FPS = 12
 EVIDENCE_DIR = "evidence"
-LOG_FILE = "evidence/session_log.jsonl"
+LOG_DIR = "evidence/logs"
 
 
 class StudentState:
@@ -193,8 +198,12 @@ class StudentState:
 
 
 class EvidenceManager:
-    def __init__(self, student_ids, camera_fps=None, evidence_fps=EVIDENCE_FPS):
+    def __init__(self, student_ids, fps, session_id, log_file, api_client, camera_fps=None, evidence_fps=EVIDENCE_FPS):
         self.fps = int(evidence_fps)
+        self.camera_fps = int(fps)
+        self.session_id = session_id
+        self.log_file = log_file
+        self.api_client = api_client
         self.frame_interval = 1.0 / float(max(1, self.fps))
         self.frame_buffer = deque(maxlen=max(1, int(PRE_EVENT_SEC * max(1, camera_fps or self.fps))))
         self.latest_frame = None
@@ -213,7 +222,7 @@ class EvidenceManager:
                 "next_write_time": None,
             }
         os.makedirs(EVIDENCE_DIR, exist_ok=True)
-        log_dir = os.path.dirname(LOG_FILE)
+        log_dir = os.path.dirname(self.log_file)
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
 
@@ -310,17 +319,22 @@ class EvidenceManager:
             return
 
         event["writer"].release()
-        duration = float(event["frame_count"]) / float(self.fps)
+        duration = round(event["frame_count"] / float(self.fps), 2)
         entry = {
+            "session_id": self.session_id,
             "timestamp": datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat(),
             "student_id": student_id,
             "signals": sorted(event["signals"]),
             "clip_file": event["clip_file"],
             "duration_sec": duration,
-            "fps": self.fps,
         }
-        with open(LOG_FILE, "a") as f:
+        with open(self.log_file, "a") as f:
             f.write(json.dumps(entry) + "\n")
+
+        if self.api_client is not None:
+            ok = self.api_client.send_event(entry)
+            if not ok:
+                print("[WARN] Failed to POST event log; kept in JSONL.", flush=True)
 
         event["active"] = False
         event["start_time"] = None
@@ -336,6 +350,57 @@ class EvidenceManager:
     def close_all(self, timestamp):
         for student_id in self.events.keys():
             self._close_event(student_id, timestamp)
+
+
+class EventAPIClient:
+    def __init__(self, url, mode="json", timeout=2.0, max_queue_size=1000):
+        self.url = url
+        self.mode = mode if mode in {"json", "form"} else "json"
+        self.timeout = float(timeout)
+        self.queue = queue.Queue(maxsize=max_queue_size)
+        self._stop_sentinel = object()
+        self._worker = threading.Thread(target=self._upload_worker, daemon=True)
+        self._worker.start()
+
+    def send_event(self, entry: dict) -> bool:
+        try:
+            self.queue.put_nowait(entry)
+            return True
+        except queue.Full:
+            print("[WARN] Event upload queue is full; dropping event upload.", flush=True)
+            return False
+
+    def _upload_worker(self):
+        while True:
+            item = self.queue.get()
+            try:
+                if item is self._stop_sentinel:
+                    return
+                self._send_event_sync(item)
+            finally:
+                self.queue.task_done()
+
+    def _send_event_sync(self, entry: dict) -> bool:
+        try:
+            if self.mode == "form":
+                body = urllib.parse.urlencode({"event": json.dumps(entry)}).encode("utf-8")
+                headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            else:
+                body = json.dumps(entry).encode("utf-8")
+                headers = {"Content-Type": "application/json"}
+
+            req = urllib.request.Request(self.url, data=body, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                return response.status == 200
+        except Exception as exc:
+            print(f"[WARN] Event log POST failed: {exc}", flush=True)
+            return False
+
+    def close(self):
+        self.queue.put(self._stop_sentinel)
+        self._worker.join(timeout=self.timeout)
+        if self._worker.is_alive():
+            print("[WARN] Event upload worker did not stop cleanly.", flush=True)
 
 
 def parse_args():
@@ -607,6 +672,19 @@ def validate_live_rois(rois):
 
 def main():
     args = parse_args()
+    session_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_file = os.path.join(LOG_DIR, f"session_{session_id}.jsonl")
+
+    post_url = os.environ.get("SP_LOG_POST_URL")
+    mode = os.environ.get("SP_LOG_POST_MODE", "json").lower()
+    timeout = float(os.environ.get("SP_LOG_TIMEOUT_SEC", "2.0"))
+    if post_url:
+        api_client = EventAPIClient(post_url, mode=mode, timeout=timeout)
+    else:
+        api_client = None
+        print("[WARN] SP_LOG_POST_URL is not set; API upload is disabled.", flush=True)
+
     _, rois = load_rois(args.rois)
     validate_live_rois(rois)
     enabled_roi_ids = resolve_enabled_roi_ids(rois, args.enabled_rois)
@@ -636,7 +714,15 @@ def main():
     )
 
     states = {roi["id"]: StudentState(roi["id"]) for roi in rois}
-    evidence = EvidenceManager(student_ids=list(states.keys()), camera_fps=args.fps, evidence_fps=EVIDENCE_FPS)
+    evidence = EvidenceManager(
+        student_ids=list(states.keys()),
+        fps=args.fps,
+        session_id=session_id,
+        log_file=log_file,
+        api_client=api_client,
+        camera_fps=args.fps,
+        evidence_fps=EVIDENCE_FPS,
+    )
     roi_index = 0
     last_print_ts = time.time()
     debug_overlay = DEBUG_OVERLAY
@@ -708,6 +794,8 @@ def main():
 
     finally:
         evidence.close_all(time.time())
+        if api_client is not None:
+            api_client.close()
         camera.release()
         pose.close()
         if not headless:
