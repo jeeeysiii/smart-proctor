@@ -1,8 +1,10 @@
 import argparse
+import json
 import math
 import os
 import time
 from collections import deque
+from datetime import datetime, timezone
 
 import cv2
 import mediapipe as mp
@@ -55,6 +57,12 @@ EMPTY_FLAG_COUNT = 6
 EMPTY_FLAG_N = 10
 STAND_FLAG_K = 2
 STRONG_SIGNALS = {"BOUND", "REACH", "STAND", "EMPTY"}
+
+PRE_EVENT_SEC = 3
+POST_SILENCE_SEC = 3
+EVIDENCE_FPS = 12
+EVIDENCE_DIR = "evidence"
+LOG_FILE = "evidence/session_log.jsonl"
 
 
 class StudentState:
@@ -182,6 +190,111 @@ class StudentState:
             self.state = "WARN"
         else:
             self.state = "OK"
+
+
+class EvidenceManager:
+    def __init__(self, student_ids, fps):
+        self.fps = int(fps)
+        self.frame_buffer = deque(maxlen=PRE_EVENT_SEC * self.fps)
+        self.latest_frame = None
+        self.events = {}
+        for student_id in student_ids:
+            self.events[student_id] = {
+                "active": False,
+                "start_time": None,
+                "last_motion_time": None,
+                "suspicious": False,
+                "writer": None,
+                "clip_file": None,
+                "signals": set(),
+                "frame_count": 0,
+            }
+        os.makedirs(EVIDENCE_DIR, exist_ok=True)
+        log_dir = os.path.dirname(LOG_FILE)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+
+    def update_frame(self, frame):
+        frame_copy = frame.copy()
+        self.latest_frame = frame_copy
+        self.frame_buffer.append(frame_copy)
+
+    def update_student(self, student_id, signals, timestamp):
+        suspicious = any(signals.get(s, False) for s in ["LEAN", "ROT", "REACH", "BOUND", "STAND"])
+        event = self.events[student_id]
+        event["suspicious"] = suspicious
+
+        if not event["active"] and suspicious:
+            timestamp_str = datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+            clip_file = f"{student_id}_{timestamp_str}.mp4"
+            filepath = os.path.join(EVIDENCE_DIR, clip_file)
+            if self.latest_frame is None:
+                return
+            frame_height, frame_width = self.latest_frame.shape[:2]
+            if frame_height <= 0 or frame_width <= 0:
+                return
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(filepath, fourcc, self.fps, (frame_width, frame_height))
+
+            event["active"] = True
+            event["start_time"] = timestamp
+            event["last_motion_time"] = timestamp
+            event["writer"] = writer
+            event["clip_file"] = clip_file
+            event["signals"] = {s for s, enabled in signals.items() if enabled}
+
+            for buffered_frame in self.frame_buffer:
+                writer.write(buffered_frame)
+            event["frame_count"] = len(self.frame_buffer)
+
+        elif event["active"]:
+            if suspicious:
+                event["last_motion_time"] = timestamp
+                event["signals"].update({s for s, enabled in signals.items() if enabled})
+
+    def write_active_events(self, timestamp):
+        if self.latest_frame is None:
+            return
+
+        for student_id, event in self.events.items():
+            if not event["active"]:
+                continue
+
+            event["writer"].write(self.latest_frame)
+            event["frame_count"] += 1
+
+            if not event["suspicious"] and (timestamp - event["last_motion_time"] > POST_SILENCE_SEC):
+                self._close_event(student_id, timestamp)
+
+    def _close_event(self, student_id, timestamp):
+        event = self.events[student_id]
+        if not event["active"]:
+            return
+
+        event["writer"].release()
+        duration = float(event["frame_count"]) / float(self.fps)
+        entry = {
+            "timestamp": datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat(),
+            "student_id": student_id,
+            "signals": sorted(event["signals"]),
+            "clip_file": event["clip_file"],
+            "duration_sec": duration,
+        }
+        with open(LOG_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+        event["active"] = False
+        event["start_time"] = None
+        event["last_motion_time"] = None
+        event["suspicious"] = False
+        event["writer"] = None
+        event["clip_file"] = None
+        event["signals"] = set()
+        event["frame_count"] = 0
+
+    def close_all(self, timestamp):
+        for student_id in self.events.keys():
+            self._close_event(student_id, timestamp)
 
 
 def parse_args():
@@ -482,6 +595,7 @@ def main():
     )
 
     states = {roi["id"]: StudentState(roi["id"]) for roi in rois}
+    evidence = EvidenceManager(student_ids=list(states.keys()), fps=args.fps)
     roi_index = 0
     last_print_ts = time.time()
     debug_overlay = DEBUG_OVERLAY
@@ -492,6 +606,8 @@ def main():
             if not ok or frame is None:
                 print("[WARN] Camera frame read failed.", flush=True)
                 continue
+
+            evidence.update_frame(frame)
 
             roi = enabled_rois[roi_index]
             sid = roi["id"]
@@ -527,6 +643,10 @@ def main():
             else:
                 student.update_no_pose()
 
+            now_ts = time.time()
+            evidence.update_student(sid, student.window[-1]["signals"], now_ts)
+            evidence.write_active_events(now_ts)
+
             if not headless:
                 out = frame.copy()
                 draw_overlay(out, rois, states, enabled_roi_ids, debug_overlay=debug_overlay)
@@ -546,6 +666,7 @@ def main():
                 last_print_ts = now
 
     finally:
+        evidence.close_all(time.time())
         camera.release()
         pose.close()
         if not headless:
