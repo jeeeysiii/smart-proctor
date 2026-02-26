@@ -11,13 +11,12 @@ import numpy as np
 from .camera_source import create_camera_source
 from .utils_rois import crop, load_rois
 
-SIGNAL_NAMES = ["TURN", "ROT", "BOUND", "REACH", "LEAN", "STAND", "EMPTY"]
+SIGNAL_NAMES = ["ROT", "BOUND", "REACH", "LEAN", "STAND", "EMPTY"]
 POINTS = {
-    "TURN": 2,
-    "ROT": 0,
+    "ROT": 2,
     "BOUND": 2,
     "REACH": 3,
-    "LEAN": 1,
+    "LEAN": 2,
     "STAND": 3,
     "EMPTY": 3,
 }
@@ -28,24 +27,19 @@ HEAD_VIS_THRESH = 0.30
 BASELINE_SAMPLES = 30
 BASELINE_ALPHA = 0.02
 
-TURN_DELTA_THRESH = 0.30
-TURN_ABS_THRESH = 0.35
-# Ear-based yaw vs tilt discrimination (normalized by shoulder_width)
-EAR_DY_TILT_REJECT = 0.12   # roll/tilt evidence
-EAR_DZ_YAW_MIN = 0.08       # yaw evidence (depth difference between ears)
-EAR_DZ_STRONG = 0.12        # optional: stronger yaw evidence (for tuning/logs)
-
-# When nose is not usable but both ears are, require slightly stronger head_offset to avoid tilt FP.
-TURN_STRONG_EARS_ONLY = 0.42
-
-ASYM_YAW_RATIO = 0.6
-LEAN_X_THRESH = 0.50
+LEAN_X_THRESH = 0.40
 STAND_Y_THRESH = 0.12
-ROT_DELTA_THRESH = 15.0
-ASYM_TURN_THRESH = 0.24
-ASYM_ABS_THRESH = 0.28
-TURN_FLAG_N = 4
-TURN_FLAG_COUNT = 3
+ROT_DELTA_THRESH = 12.0
+
+LEAN_WARN_N = 3
+LEAN_WARN_COUNT = 2
+LEAN_FLAG_N = 4
+LEAN_FLAG_COUNT = 3
+
+ROT_WARN_N = 3
+ROT_WARN_COUNT = 2
+ROT_FLAG_N = 4
+ROT_FLAG_COUNT = 3
 
 DEBUG_OVERLAY = False
 
@@ -84,11 +78,9 @@ class StudentState:
             return
         required = [
             "shoulder_angle_deg",
-            "head_offset",
-            "head_asym",
             "shoulder_mid_x",
-            "shoulder_width",
             "shoulder_mid_y",
+            "shoulder_width",
         ]
         if any(metrics.get(k) is None for k in required):
             return
@@ -110,7 +102,7 @@ class StudentState:
             return
         if signals.get("EMPTY", False):
             return
-        if signals.get("TURN", False) or signals.get("ROT", False):
+        if signals.get("ROT", False):
             return
         for key in self.baseline.keys():
             cur = metrics.get(key)
@@ -146,21 +138,16 @@ class StudentState:
         cur_points = self.last_points
         strong_now = any(name in STRONG_SIGNALS for name in self.active_signals)
         roll_sum = self.rolling_sum()
-        turn_flag = self.rolling_count("TURN", n=TURN_FLAG_N) >= TURN_FLAG_COUNT
+        lean_warn = self.rolling_count("LEAN", n=LEAN_WARN_N) >= LEAN_WARN_COUNT
+        lean_flag = self.rolling_count("LEAN", n=LEAN_FLAG_N) >= LEAN_FLAG_COUNT
+        rot_warn = self.rolling_count("ROT", n=ROT_WARN_N) >= ROT_WARN_COUNT
+        rot_flag = self.rolling_count("ROT", n=ROT_FLAG_N) >= ROT_FLAG_COUNT
         reach_count = self.rolling_count("REACH")
         bound_count = self.rolling_count("BOUND")
         stand_count = self.rolling_count("STAND")
         empty_warn_count = self.rolling_count("EMPTY", EMPTY_WARN_N)
         empty_flag_count = self.rolling_count("EMPTY", EMPTY_FLAG_N)
-        if turn_flag:
-            roll_sum_for_flag = roll_sum
-        else:
-            roll_sum_for_flag = int(
-                sum(
-                    item["points"] - (POINTS["TURN"] if item["signals"].get("TURN", False) else 0)
-                    for item in self.window
-                )
-            )
+        roll_sum_for_flag = roll_sum
 
         recent = list(self.window)
         stand_pattern_count = 0
@@ -176,15 +163,16 @@ class StudentState:
             or stand_count >= STAND_FLAG_K
             or stand_pattern_count >= STAND_FLAG_K
             or empty_flag_count >= EMPTY_FLAG_COUNT
-            or turn_flag
+            or lean_flag
+            or rot_flag
         )
         warn = warn or empty_warn_count >= EMPTY_WARN_COUNT or stand_count >= 1 or stand_pattern_count >= 1
+        warn = warn or lean_warn or rot_warn
 
         if self.state == "FLAG":
             recent_strong = reach_count > 0 or bound_count > 0 or stand_count > 0
             recent_empty = empty_warn_count > 0
-            turn_flag = self.rolling_count("TURN", n=TURN_FLAG_N) >= TURN_FLAG_COUNT
-            if roll_sum_for_flag < CLEAR_SUM and not recent_strong and not recent_empty and not turn_flag:
+            if roll_sum_for_flag < CLEAR_SUM and not recent_strong and not recent_empty:
                 self.state = "OK"
             return
 
@@ -268,16 +256,9 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
 
     signals = {name: False for name in SIGNAL_NAMES}
     metrics = {
-        "head_offset": None,
         "shoulder_angle_deg": None,
         "shoulder_angle_delta": None,
-        "head_offset_delta": None,
-        "head_asym": None,
-        "asym_delta": None,
         "lean_x": None,
-        "ear_dy_norm": None,
-        "ear_dz_norm": None,
-        "yaw_consistent": None,
         "shoulder_mid_x": None,
         "shoulder_mid_y": None,
         "shoulder_mid_y_delta": None,
@@ -298,12 +279,9 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
 
         head_anchor_xy = None
         if shoulder_width > 1e-4:
-            head_x = None
             if nose_reliable:
-                head_x = nose.x
                 head_anchor_xy = (nose.x, nose.y)
             elif ears_both_reliable:
-                head_x = (l_ear.x + r_ear.x) / 2.0
                 head_anchor_xy = ((l_ear.x + r_ear.x) / 2.0, (l_ear.y + r_ear.y) / 2.0)
             elif ear_one_reliable:
                 if l_ear.visibility >= HEAD_VIS_THRESH:
@@ -311,59 +289,11 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
                 else:
                     head_anchor_xy = (r_ear.x, r_ear.y)
 
-            asym = None
-            if nose_reliable:
-                d_l = math.hypot(nose.x - l_sh.x, nose.y - l_sh.y) / shoulder_width
-                d_r = math.hypot(nose.x - r_sh.x, nose.y - r_sh.y) / shoulder_width
-                asym = d_l - d_r
-                metrics["head_asym"] = float(asym)
-
-            if head_x is not None:
-                head_offset = (head_x - shoulder_mid_x) / shoulder_width
-                metrics["head_offset"] = float(head_offset)
-                ear_dy_norm = None
-                ear_dz_norm = None
-                tilt_reject = False
-                ears_both = l_ear.visibility >= HEAD_VIS_THRESH and r_ear.visibility >= HEAD_VIS_THRESH
-                if ears_both:
-                    ear_dy_norm = abs(l_ear.y - r_ear.y) / shoulder_width
-                    ear_dz_norm = abs(l_ear.z - r_ear.z) / shoulder_width
-                    metrics["ear_dy_norm"] = float(ear_dy_norm)
-                    metrics["ear_dz_norm"] = float(ear_dz_norm)
-
-                if ear_dy_norm is not None and ear_dz_norm is not None:
-                    # Reject only when it looks like roll: ears vertically misaligned but not depth-separated.
-                    tilt_reject = (ear_dy_norm > EAR_DY_TILT_REJECT) and (ear_dz_norm < EAR_DZ_YAW_MIN)
-
-                if nose_reliable and asym is not None:
-                    yaw_consistent = abs(asym) > ASYM_YAW_RATIO * abs(head_offset)
-                    turn_abs = abs(head_offset) > TURN_ABS_THRESH
-                elif ears_both_reliable:
-                    yaw_consistent = (ear_dz_norm is not None) and (ear_dz_norm > EAR_DZ_YAW_MIN)
-                    turn_abs = abs(head_offset) > TURN_STRONG_EARS_ONLY
-                else:
-                    yaw_consistent = False
-                    turn_abs = False
-
-                metrics["yaw_consistent"] = float(yaw_consistent)
-                signals["TURN"] = turn_abs and yaw_consistent and not tilt_reject
-
-            if baseline is not None and nose_reliable and asym is not None and metrics["head_offset"] is not None:
-                head_offset = metrics["head_offset"]
-                head_offset_delta = head_offset - baseline["head_offset"]
-                asym_delta = asym - baseline["head_asym"]
+            if baseline is not None:
                 lean_x = (shoulder_mid_x - baseline["shoulder_mid_x"]) / shoulder_width
                 stand_y_delta = baseline["shoulder_mid_y"] - shoulder_mid_y
-                metrics["head_offset_delta"] = float(head_offset_delta)
-                metrics["asym_delta"] = float(asym_delta)
                 metrics["lean_x"] = float(lean_x)
                 metrics["shoulder_mid_y_delta"] = float(stand_y_delta)
-                turn_delta = (
-                    abs(head_offset_delta) > TURN_DELTA_THRESH
-                    or abs(asym_delta) > ASYM_TURN_THRESH
-                )
-                if not tilt_reject:
-                    signals["TURN"] = signals["TURN"] or turn_delta
                 signals["LEAN"] = abs(lean_x) > LEAN_X_THRESH
                 signals["STAND"] = stand_y_delta > STAND_Y_THRESH
 
@@ -460,7 +390,6 @@ def draw_overlay(frame, rois, states, enabled_roi_ids, debug_overlay=False):
         cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
 
         short = {
-            "TURN": "T",
             "LEAN": "L",
             "REACH": "R",
             "BOUND": "B",
@@ -484,14 +413,9 @@ def draw_overlay(frame, rois, states, enabled_roi_ids, debug_overlay=False):
                 return f"{float(value):+.2f}"
 
             line2 = None
-            d_h = fmt("head_offset_delta")
-            d_a = fmt("asym_delta")
-            if d_h is not None and d_a is not None:
-                line2 = f"dH={d_h} a={d_a}"
-            else:
-                lean = fmt("lean_x")
-                if lean is not None:
-                    line2 = f"lean={lean}"
+            lean = fmt("lean_x")
+            if lean is not None:
+                line2 = f"lean={lean}"
 
             if line2:
                 y2 = min(y + h - 4, max(12, y + 16))
