@@ -289,8 +289,9 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
         dy = r_sh.y - l_sh.y
         shoulder_angle_deg = math.degrees(math.atan2(dy, dx))
 
-        # Roll relative to horizontal (0°)
-        shoulder_roll = shoulder_angle_deg
+        # Roll relative to horizontal (0°), normalized modulo 180° so that a
+        # level torso is always near 0° regardless of shoulder ordering.
+        shoulder_roll = ((shoulder_angle_deg + 90.0) % 180.0) - 90.0
 
         metrics["shoulder_angle_deg"] = float(shoulder_angle_deg)
         metrics["shoulder_roll"] = float(shoulder_roll)
