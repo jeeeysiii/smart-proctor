@@ -193,9 +193,10 @@ class StudentState:
 
 
 class EvidenceManager:
-    def __init__(self, student_ids, fps):
-        self.fps = int(fps)
-        self.frame_buffer = deque(maxlen=PRE_EVENT_SEC * self.fps)
+    def __init__(self, student_ids, camera_fps=None, evidence_fps=EVIDENCE_FPS):
+        self.fps = int(evidence_fps)
+        self.frame_interval = 1.0 / float(max(1, self.fps))
+        self.frame_buffer = deque(maxlen=max(1, int(PRE_EVENT_SEC * max(1, camera_fps or self.fps))))
         self.latest_frame = None
         self.events = {}
         for student_id in student_ids:
@@ -208,16 +209,54 @@ class EvidenceManager:
                 "clip_file": None,
                 "signals": set(),
                 "frame_count": 0,
+                "last_write_time": None,
+                "next_write_time": None,
             }
         os.makedirs(EVIDENCE_DIR, exist_ok=True)
         log_dir = os.path.dirname(LOG_FILE)
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
 
-    def update_frame(self, frame):
+    def update_frame(self, frame, timestamp):
         frame_copy = frame.copy()
         self.latest_frame = frame_copy
-        self.frame_buffer.append(frame_copy)
+        self.frame_buffer.append((timestamp, frame_copy))
+
+    def _should_write(self, event, now):
+        if event["next_write_time"] is None:
+            return True
+        return now >= event["next_write_time"]
+
+    def _write_frame(self, event, frame, write_time):
+        event["writer"].write(frame)
+        event["frame_count"] += 1
+        event["last_write_time"] = write_time
+        if event["next_write_time"] is None:
+            event["next_write_time"] = write_time + self.frame_interval
+        else:
+            event["next_write_time"] += self.frame_interval
+
+    def _write_buffered_pre_event(self, event, timestamp):
+        cutoff = timestamp - PRE_EVENT_SEC
+        buffered = [(ts, frame) for ts, frame in self.frame_buffer if ts >= cutoff and ts <= timestamp]
+        if not buffered:
+            self._write_frame(event, self.latest_frame, timestamp)
+            return
+
+        buffered.sort(key=lambda item: item[0])
+        slot_time = buffered[0][0]
+        buffer_idx = 0
+        frame_for_slot = buffered[0][1]
+
+        while slot_time <= timestamp:
+            while buffer_idx + 1 < len(buffered) and buffered[buffer_idx + 1][0] <= slot_time:
+                buffer_idx += 1
+                frame_for_slot = buffered[buffer_idx][1]
+            self._write_frame(event, frame_for_slot, slot_time)
+            slot_time += self.frame_interval
+
+        if event["last_write_time"] is None or event["last_write_time"] < timestamp:
+            self._write_frame(event, self.latest_frame, timestamp)
 
     def update_student(self, student_id, signals, timestamp):
         suspicious = any(signals.get(s, False) for s in ["LEAN", "ROT", "REACH", "BOUND", "STAND"])
@@ -242,10 +281,7 @@ class EvidenceManager:
             event["writer"] = writer
             event["clip_file"] = clip_file
             event["signals"] = {s for s, enabled in signals.items() if enabled}
-
-            for buffered_frame in self.frame_buffer:
-                writer.write(buffered_frame)
-            event["frame_count"] = len(self.frame_buffer)
+            self._write_buffered_pre_event(event, timestamp)
 
         elif event["active"]:
             if suspicious:
@@ -260,8 +296,10 @@ class EvidenceManager:
             if not event["active"]:
                 continue
 
-            event["writer"].write(self.latest_frame)
-            event["frame_count"] += 1
+            if self._should_write(event, timestamp):
+                while self._should_write(event, timestamp):
+                    write_time = event["next_write_time"] if event["next_write_time"] is not None else timestamp
+                    self._write_frame(event, self.latest_frame, write_time)
 
             if not event["suspicious"] and (timestamp - event["last_motion_time"] > POST_SILENCE_SEC):
                 self._close_event(student_id, timestamp)
@@ -279,6 +317,7 @@ class EvidenceManager:
             "signals": sorted(event["signals"]),
             "clip_file": event["clip_file"],
             "duration_sec": duration,
+            "fps": self.fps,
         }
         with open(LOG_FILE, "a") as f:
             f.write(json.dumps(entry) + "\n")
@@ -291,6 +330,8 @@ class EvidenceManager:
         event["clip_file"] = None
         event["signals"] = set()
         event["frame_count"] = 0
+        event["last_write_time"] = None
+        event["next_write_time"] = None
 
     def close_all(self, timestamp):
         for student_id in self.events.keys():
@@ -595,7 +636,7 @@ def main():
     )
 
     states = {roi["id"]: StudentState(roi["id"]) for roi in rois}
-    evidence = EvidenceManager(student_ids=list(states.keys()), fps=args.fps)
+    evidence = EvidenceManager(student_ids=list(states.keys()), camera_fps=args.fps, evidence_fps=EVIDENCE_FPS)
     roi_index = 0
     last_print_ts = time.time()
     debug_overlay = DEBUG_OVERLAY
@@ -607,7 +648,8 @@ def main():
                 print("[WARN] Camera frame read failed.", flush=True)
                 continue
 
-            evidence.update_frame(frame)
+            now_ts = time.time()
+            evidence.update_frame(frame, now_ts)
 
             roi = enabled_rois[roi_index]
             sid = roi["id"]
@@ -643,7 +685,6 @@ def main():
             else:
                 student.update_no_pose()
 
-            now_ts = time.time()
             evidence.update_student(sid, student.window[-1]["signals"], now_ts)
             evidence.write_active_events(now_ts)
 
