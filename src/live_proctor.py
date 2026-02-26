@@ -13,7 +13,7 @@ from .utils_rois import crop, load_rois
 
 SIGNAL_NAMES = ["ROT", "BOUND", "REACH", "LEAN", "STAND", "EMPTY"]
 POINTS = {
-    "ROT": 2,
+    "ROT": 1,
     "BOUND": 2,
     "REACH": 3,
     "LEAN": 2,
@@ -29,7 +29,7 @@ BASELINE_ALPHA = 0.02
 
 LEAN_X_THRESH = 0.40
 STAND_Y_THRESH = 0.12
-ROT_DELTA_THRESH = 12.0
+ROT_ROLL_THRESH = 15.0
 
 LEAN_WARN_N = 3
 LEAN_WARN_COUNT = 2
@@ -224,18 +224,6 @@ def resolve_enabled_roi_ids(rois, enabled_rois_arg):
         raise ValueError("Enabled ROI list resolved to empty after validation.")
     return set(enabled_in_order)
 
-
-def normalize_angle_diff(current, baseline):
-    if baseline is None:
-        return 0.0
-    diff = current - baseline
-    while diff > 180:
-        diff -= 360
-    while diff < -180:
-        diff += 360
-    return diff
-
-
 def compute_signals(landmarks, roi, neighbor_roi, baseline):
     lm = mp.solutions.pose.PoseLandmark
     nose = landmarks[lm.NOSE]
@@ -257,7 +245,7 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
     signals = {name: False for name in SIGNAL_NAMES}
     metrics = {
         "shoulder_angle_deg": None,
-        "shoulder_angle_delta": None,
+        "shoulder_roll": None,
         "lean_x": None,
         "shoulder_mid_x": None,
         "shoulder_mid_y": None,
@@ -300,10 +288,16 @@ def compute_signals(landmarks, roi, neighbor_roi, baseline):
         dx = r_sh.x - l_sh.x
         dy = r_sh.y - l_sh.y
         shoulder_angle_deg = math.degrees(math.atan2(dy, dx))
-        angle_delta = normalize_angle_diff(shoulder_angle_deg, baseline["shoulder_angle_deg"] if baseline else None)
+
+        # Roll relative to horizontal (0°), normalized modulo 180° so that a
+        # level torso is always near 0° regardless of shoulder ordering.
+        shoulder_roll = ((shoulder_angle_deg + 90.0) % 180.0) - 90.0
+
         metrics["shoulder_angle_deg"] = float(shoulder_angle_deg)
-        metrics["shoulder_angle_delta"] = float(angle_delta)
-        signals["ROT"] = baseline is not None and abs(angle_delta) > ROT_DELTA_THRESH
+        metrics["shoulder_roll"] = float(shoulder_roll)
+
+        # Symmetric roll detection (left or right)
+        signals["ROT"] = abs(shoulder_roll) > ROT_ROLL_THRESH
 
         margin_x = 0.1 * roi_w
         margin_y = 0.1 * roi_h
@@ -416,6 +410,10 @@ def draw_overlay(frame, rois, states, enabled_roi_ids, debug_overlay=False):
             lean = fmt("lean_x")
             if lean is not None:
                 line2 = f"lean={lean}"
+
+            roll = fmt("shoulder_roll")
+            if roll is not None:
+                line2 = f"{line2} roll={roll}" if line2 else f"roll={roll}"
 
             if line2:
                 y2 = min(y + h - 4, max(12, y + 16))
