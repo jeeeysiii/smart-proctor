@@ -1,19 +1,18 @@
 import argparse
+import copy
 import json
 import math
 import os
 import queue
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from collections import deque
 from datetime import datetime, timezone
 
 import cv2
 import mediapipe as mp
 import numpy as np
+import requests
 
 from .camera_source import create_camera_source
 from .utils_rois import crop, load_rois
@@ -67,7 +66,6 @@ PRE_EVENT_SEC = 3
 POST_SILENCE_SEC = 3
 EVIDENCE_FPS = 12
 EVIDENCE_DIR = "evidence"
-LOG_DIR = "evidence/logs"
 
 
 class StudentState:
@@ -353,54 +351,48 @@ class EvidenceManager:
 
 
 class EventAPIClient:
-    def __init__(self, url, mode="json", timeout=2.0, max_queue_size=1000):
+    def __init__(self, url: str, timeout_sec: float = 2.0, max_queue_size: int = 256):
         self.url = url
-        self.mode = mode if mode in {"json", "form"} else "json"
-        self.timeout = float(timeout)
-        self.queue = queue.Queue(maxsize=max_queue_size)
+        self.timeout_sec = float(timeout_sec)
+        self._queue = queue.Queue(maxsize=max_queue_size)
         self._stop_sentinel = object()
-        self._worker = threading.Thread(target=self._upload_worker, daemon=True)
+        self._worker = threading.Thread(target=self._worker_loop, name="event-log-uploader", daemon=True)
         self._worker.start()
 
-    def send_event(self, entry: dict) -> bool:
+    def _post_event(self, payload: dict) -> bool:
+        headers = {"User-Agent": "smart-proctor-pi/1.0", "Accept": "application/json"}
+        response = requests.post(self.url, json=payload, headers=headers, timeout=self.timeout_sec)
+        if response.status_code == 200:
+            return True
+        print(f"[WARN] Event log post failed: HTTP {response.status_code}: {response.text[:200]}", flush=True)
+        return False
+
+    def _worker_loop(self):
+        while True:
+            payload = self._queue.get()
+            try:
+                if payload is self._stop_sentinel:
+                    return
+                self._post_event(payload)
+            except requests.RequestException as exc:
+                print(f"[WARN] Event log post failed: {exc}", flush=True)
+            finally:
+                self._queue.task_done()
+
+    def send_event(self, payload: dict) -> bool:
         try:
-            self.queue.put_nowait(entry)
+            self._queue.put_nowait(copy.deepcopy(payload))
             return True
         except queue.Full:
-            print("[WARN] Event upload queue is full; dropping event upload.", flush=True)
-            return False
-
-    def _upload_worker(self):
-        while True:
-            item = self.queue.get()
-            try:
-                if item is self._stop_sentinel:
-                    return
-                self._send_event_sync(item)
-            finally:
-                self.queue.task_done()
-
-    def _send_event_sync(self, entry: dict) -> bool:
-        try:
-            if self.mode == "form":
-                body = urllib.parse.urlencode({"event": json.dumps(entry)}).encode("utf-8")
-                headers = {"Content-Type": "application/x-www-form-urlencoded"}
-            else:
-                body = json.dumps(entry).encode("utf-8")
-                headers = {"Content-Type": "application/json"}
-
-            req = urllib.request.Request(self.url, data=body, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=self.timeout) as response:
-                return response.status == 200
-        except Exception as exc:
-            print(f"[WARN] Event log POST failed: {exc}", flush=True)
+            print("[WARN] Event upload queue full; kept event in JSONL only.", flush=True)
             return False
 
     def close(self):
-        self.queue.put(self._stop_sentinel)
-        self._worker.join(timeout=self.timeout)
-        if self._worker.is_alive():
-            print("[WARN] Event upload worker did not stop cleanly.", flush=True)
+        try:
+            self._queue.put(self._stop_sentinel)
+            self._worker.join(timeout=self.timeout_sec + 1.0)
+        except Exception:
+            return
 
 
 def parse_args():
@@ -673,17 +665,18 @@ def validate_live_rois(rois):
 def main():
     args = parse_args()
     session_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    os.makedirs(LOG_DIR, exist_ok=True)
-    log_file = os.path.join(LOG_DIR, f"session_{session_id}.jsonl")
+    log_dir = "evidence/logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"session_{session_id}.jsonl")
 
-    post_url = os.environ.get("SP_LOG_POST_URL")
-    mode = os.environ.get("SP_LOG_POST_MODE", "json").lower()
-    timeout = float(os.environ.get("SP_LOG_TIMEOUT_SEC", "2.0"))
+    post_url = os.environ.get("SP_LOG_POST_URL", "").strip()
+    timeout_sec = float(os.environ.get("SP_LOG_TIMEOUT_SEC", "2.0"))
     if post_url:
-        api_client = EventAPIClient(post_url, mode=mode, timeout=timeout)
+        api_client = EventAPIClient(post_url, timeout_sec=timeout_sec)
+        print(f"[INFO] Event log POST enabled: {post_url}", flush=True)
     else:
         api_client = None
-        print("[WARN] SP_LOG_POST_URL is not set; API upload is disabled.", flush=True)
+        print("[WARN] SP_LOG_POST_URL not set; DB upload disabled (JSONL only).", flush=True)
 
     _, rois = load_rois(args.rois)
     validate_live_rois(rois)
