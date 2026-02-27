@@ -302,8 +302,8 @@ def main():
             if not detection_active and remote_state == 1:
                 detection_active = True
                 session_id = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S")
-                for s in states.values():
-                    s.reset_baseline()
+                states = {roi["id"]: lp.StudentState(roi["id"]) for roi in rois}
+                evidence.close_all(time.time())
                 evidence = lp.EvidenceManager(
                     student_ids=list(states.keys()),
                     fps=args.fps,
