@@ -1,7 +1,10 @@
 import argparse
+import copy
 import json
 import math
 import os
+import queue
+import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -348,21 +351,48 @@ class EvidenceManager:
 
 
 class EventAPIClient:
-    def __init__(self, url: str, timeout_sec: float = 2.0):
+    def __init__(self, url: str, timeout_sec: float = 2.0, max_queue_size: int = 256):
         self.url = url
         self.timeout_sec = float(timeout_sec)
+        self._queue = queue.Queue(maxsize=max_queue_size)
+        self._stop_sentinel = object()
+        self._worker = threading.Thread(target=self._worker_loop, name="event-log-uploader", daemon=True)
+        self._worker.start()
+
+    def _post_event(self, payload: dict) -> bool:
+        headers = {"User-Agent": "smart-proctor-pi/1.0", "Accept": "application/json"}
+        response = requests.post(self.url, json=payload, headers=headers, timeout=self.timeout_sec)
+        if response.status_code == 200:
+            return True
+        print(f"[WARN] Event log post failed: HTTP {response.status_code}: {response.text[:200]}", flush=True)
+        return False
+
+    def _worker_loop(self):
+        while True:
+            payload = self._queue.get()
+            try:
+                if payload is self._stop_sentinel:
+                    return
+                self._post_event(payload)
+            except requests.RequestException as exc:
+                print(f"[WARN] Event log post failed: {exc}", flush=True)
+            finally:
+                self._queue.task_done()
 
     def send_event(self, payload: dict) -> bool:
         try:
-            headers = {"User-Agent": "smart-proctor-pi/1.0", "Accept": "application/json"}
-            response = requests.post(self.url, json=payload, headers=headers, timeout=self.timeout_sec)
-            if response.status_code == 200:
-                return True
-            print(f"[WARN] Event log post failed: HTTP {response.status_code}: {response.text[:200]}", flush=True)
+            self._queue.put_nowait(copy.deepcopy(payload))
+            return True
+        except queue.Full:
+            print("[WARN] Event upload queue full; kept event in JSONL only.", flush=True)
             return False
-        except requests.RequestException as exc:
-            print(f"[WARN] Event log post failed: {exc}", flush=True)
-            return False
+
+    def close(self):
+        try:
+            self._queue.put(self._stop_sentinel)
+            self._worker.join(timeout=self.timeout_sec + 1.0)
+        except Exception:
+            return
 
 
 def parse_args():
@@ -757,6 +787,8 @@ def main():
 
     finally:
         evidence.close_all(time.time())
+        if api_client is not None:
+            api_client.close()
         camera.release()
         pose.close()
         if not headless:
