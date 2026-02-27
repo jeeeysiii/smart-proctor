@@ -6,8 +6,7 @@ import queue
 import threading
 import time
 from collections import deque
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from datetime import datetime
 
 import cv2
 import mediapipe as mp
@@ -68,11 +67,7 @@ EVIDENCE_FPS = 12
 EVIDENCE_DIR = "evidence"
 LOG_DIR = os.path.join(EVIDENCE_DIR, "logs")
 PENDING_FILE = os.path.join(LOG_DIR, "pending_uploads.jsonl")
-try:
-    LOCAL_TZ = ZoneInfo("Asia/Manila")
-except ZoneInfoNotFoundError:
-    # Fallback for environments without IANA timezone data (e.g., slim images without tzdata).
-    LOCAL_TZ = timezone(timedelta(hours=8), name="Asia/Manila")
+LOCAL_TZ = datetime.now().astimezone().tzinfo
 
 
 def atomic_write(path, data_bytes):
@@ -297,7 +292,7 @@ class EvidenceManager:
                 return
 
         if not event["active"] and is_suspicious:
-            timestamp_str = datetime.fromtimestamp(timestamp, tz=LOCAL_TZ).strftime("%Y%m%dT%H%M%S_%f")
+            timestamp_str = datetime.fromtimestamp(timestamp).astimezone().strftime("%Y%m%dT%H%M%S_%f")
             clip_file = f"{student_id}_{timestamp_str}.mp4"
             filepath = os.path.join(EVIDENCE_DIR, clip_file)
             if self.latest_frame is None:
@@ -350,7 +345,7 @@ class EvidenceManager:
         clip_file = event["clip_file"]
         entry = {
             "event_id": f"{self.session_id}:{student_id}:{clip_file}",
-            "timestamp": datetime.fromtimestamp(timestamp, tz=LOCAL_TZ).isoformat(),
+            "timestamp": datetime.fromtimestamp(timestamp).astimezone().isoformat(),
             "session_id": self.session_id,
             "student_id": student_id,
             "signals": sorted(event["signals"]),
@@ -847,7 +842,8 @@ def validate_live_rois(rois):
 
 def main():
     args = parse_args()
-    session_id = datetime.now(LOCAL_TZ).strftime("%Y%m%dT%H%M%S")
+    session_id = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S")
+    print(f"[INFO] Local now: {datetime.now().astimezone().isoformat()}", flush=True)
     os.makedirs(LOG_DIR, exist_ok=True)
     log_file = os.path.join(LOG_DIR, f"session_{session_id}.jsonl")
 
