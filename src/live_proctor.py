@@ -6,7 +6,8 @@ import queue
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import cv2
 import mediapipe as mp
@@ -67,6 +68,11 @@ EVIDENCE_FPS = 12
 EVIDENCE_DIR = "evidence"
 LOG_DIR = os.path.join(EVIDENCE_DIR, "logs")
 PENDING_FILE = os.path.join(LOG_DIR, "pending_uploads.jsonl")
+try:
+    LOCAL_TZ = ZoneInfo("Asia/Manila")
+except ZoneInfoNotFoundError:
+    # Fallback for environments without IANA timezone data (e.g., slim images without tzdata).
+    LOCAL_TZ = timezone(timedelta(hours=8), name="Asia/Manila")
 
 
 def atomic_write(path, data_bytes):
@@ -228,6 +234,8 @@ class EvidenceManager:
                 "frame_count": 0,
                 "last_write_time": None,
                 "next_write_time": None,
+                "prev_empty": False,
+                "prev_suspicious": False,
             }
         os.makedirs(EVIDENCE_DIR, exist_ok=True)
         log_dir = os.path.dirname(self.log_file)
@@ -276,12 +284,20 @@ class EvidenceManager:
             self._write_frame(event, self.latest_frame, timestamp)
 
     def update_student(self, student_id, signals, timestamp):
-        suspicious = any(signals.get(s, False) for s in ["LEAN", "ROT", "REACH", "BOUND", "STAND"])
+        is_empty = bool(signals.get("EMPTY", False))
+        is_suspicious = any(signals.get(s, False) for s in ["LEAN", "ROT", "REACH", "BOUND", "STAND"])
         event = self.events[student_id]
-        event["suspicious"] = suspicious
+        event["suspicious"] = is_suspicious
 
-        if not event["active"] and suspicious:
-            timestamp_str = datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+        if event["active"]:
+            if not event["prev_empty"] and is_empty:
+                self._close_event(student_id, timestamp)
+                event["prev_empty"] = is_empty
+                event["prev_suspicious"] = is_suspicious
+                return
+
+        if not event["active"] and is_suspicious:
+            timestamp_str = datetime.fromtimestamp(timestamp, tz=LOCAL_TZ).strftime("%Y%m%dT%H%M%S_%f")
             clip_file = f"{student_id}_{timestamp_str}.mp4"
             filepath = os.path.join(EVIDENCE_DIR, clip_file)
             if self.latest_frame is None:
@@ -301,9 +317,12 @@ class EvidenceManager:
             self._write_buffered_pre_event(event, timestamp)
 
         elif event["active"]:
-            if suspicious:
+            if is_suspicious:
                 event["last_motion_time"] = timestamp
                 event["signals"].update({s for s, enabled in signals.items() if enabled})
+
+        event["prev_empty"] = is_empty
+        event["prev_suspicious"] = is_suspicious
 
     def write_active_events(self, timestamp):
         if self.latest_frame is None:
@@ -331,7 +350,7 @@ class EvidenceManager:
         clip_file = event["clip_file"]
         entry = {
             "event_id": f"{self.session_id}:{student_id}:{clip_file}",
-            "timestamp": datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat(),
+            "timestamp": datetime.fromtimestamp(timestamp, tz=LOCAL_TZ).isoformat(),
             "session_id": self.session_id,
             "student_id": student_id,
             "signals": sorted(event["signals"]),
@@ -354,6 +373,8 @@ class EvidenceManager:
         event["frame_count"] = 0
         event["last_write_time"] = None
         event["next_write_time"] = None
+        event["prev_empty"] = False
+        event["prev_suspicious"] = False
 
     def close_all(self, timestamp):
         for student_id in self.events.keys():
@@ -826,7 +847,7 @@ def validate_live_rois(rois):
 
 def main():
     args = parse_args()
-    session_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    session_id = datetime.now(LOCAL_TZ).strftime("%Y%m%dT%H%M%S")
     os.makedirs(LOG_DIR, exist_ok=True)
     log_file = os.path.join(LOG_DIR, f"session_{session_id}.jsonl")
 
