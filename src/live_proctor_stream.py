@@ -46,7 +46,7 @@ class FrameHub:
                 continue
             ts = time.time()
             with self._cond:
-                self.latest_frame = frame
+                self.latest_frame = frame.copy()
                 self.latest_timestamp = ts
                 self.frame_id += 1
                 self._cond.notify_all()
@@ -87,7 +87,10 @@ class HubBroadcaster:
 
     def wait_next(self, last_frame_id, timeout=2.0):
         frame, _ts, frame_id = self.hub.wait_next(last_frame_id, timeout=timeout)
-        if frame_id == last_frame_id or frame is None:
+        if frame is None:
+            return frame_id, None
+        if frame_id == last_frame_id:
+            time.sleep(0.01)
             return frame_id, None
 
         now = time.monotonic()
