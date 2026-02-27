@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import cv2
 import mediapipe as mp
+from werkzeug.serving import make_server
 
 from . import live_proctor as lp
 from .camera_source import create_camera_source
@@ -173,6 +174,7 @@ def main():
 
     stream_thread = None
     stream_broadcaster = None
+    stream_server = None
     if args.enable_stream:
         stream_broadcaster = HubBroadcaster(
             hub=hub,
@@ -183,8 +185,20 @@ def main():
         stream_args = SimpleNamespace(token=args.token)
         app = build_app(stream_broadcaster, stream_args)
 
+        try:
+            stream_server = make_server(
+                args.stream_host,
+                args.stream_port,
+                app,
+                threaded=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to start MJPEG server on {args.stream_host}:{args.stream_port}"
+            ) from exc
+
         def run_stream():
-            app.run(host=args.stream_host, port=args.stream_port, debug=False, threaded=True)
+            stream_server.serve_forever()
 
         stream_thread = threading.Thread(target=run_stream, name="mjpeg-server", daemon=True)
         stream_thread.start()
@@ -298,6 +312,8 @@ def main():
             uploader.join(3.0)
         if stream_broadcaster is not None:
             stream_broadcaster.stop()
+        if stream_server is not None:
+            stream_server.shutdown()
         camera.release()
         pose.close()
         if not headless:
