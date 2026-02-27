@@ -6,8 +6,8 @@ import queue
 import threading
 import time
 from collections import deque
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import cv2
 import mediapipe as mp
@@ -68,7 +68,11 @@ EVIDENCE_FPS = 12
 EVIDENCE_DIR = "evidence"
 LOG_DIR = os.path.join(EVIDENCE_DIR, "logs")
 PENDING_FILE = os.path.join(LOG_DIR, "pending_uploads.jsonl")
-LOCAL_TZ = ZoneInfo("Asia/Manila")
+try:
+    LOCAL_TZ = ZoneInfo("Asia/Manila")
+except ZoneInfoNotFoundError:
+    # Fallback for environments without IANA timezone data (e.g., slim images without tzdata).
+    LOCAL_TZ = timezone(timedelta(hours=8), name="Asia/Manila")
 
 
 def atomic_write(path, data_bytes):
