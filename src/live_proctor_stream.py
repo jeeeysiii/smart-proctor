@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import cv2
 import mediapipe as mp
+import requests
 from werkzeug.serving import make_server
 
 from . import live_proctor as lp
@@ -13,7 +14,60 @@ from .camera_source import create_camera_source
 from .utils_rois import crop, load_rois
 from .video_stream_mjpeg import build_app
 
+CONTROL_URL = "https://smartproctoring.online/get_status.php"
+CONTROL_POLL_SEC = 2.0
 DEVICE_ID = "2026"
+
+
+class ControlPoller:
+    def __init__(self, device_id, interval_sec):
+        self.device_id = device_id
+        self.interval_sec = interval_sec
+        self._running = False
+        self._thread = None
+        self.current_state = 0
+        self._lock = threading.Lock()
+        self._last_warn = 0
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def get_state(self):
+        with self._lock:
+            return self.current_state
+
+    def _loop(self):
+        session = requests.Session()
+        while self._running:
+            try:
+                r = session.get(
+                    CONTROL_URL,
+                    params={"device_id": self.device_id},
+                    timeout=3.0,
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    if "start" in data:
+                        with self._lock:
+                            self.current_state = int(data["start"])
+                else:
+                    self._warn()
+            except Exception:
+                self._warn()
+            time.sleep(self.interval_sec)
+
+    def _warn(self):
+        now = time.time()
+        if now - self._last_warn > 10:
+            print("[WARN] Control poll failed (keeping last state)", flush=True)
+            self._last_warn = now
 
 
 class FrameHub:
@@ -233,6 +287,10 @@ def main():
         evidence_fps=lp.EVIDENCE_FPS,
     )
 
+    poller = ControlPoller(DEVICE_ID, CONTROL_POLL_SEC)
+    poller.start()
+    detection_active = False
+
     roi_index = 0
     last_print_ts = time.time()
     debug_overlay = lp.DEBUG_OVERLAY
@@ -240,6 +298,28 @@ def main():
 
     try:
         while True:
+            remote_state = poller.get_state()
+            if not detection_active and remote_state == 1:
+                detection_active = True
+                session_id = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S")
+                for s in states.values():
+                    s.reset_baseline()
+                evidence = lp.EvidenceManager(
+                    student_ids=list(states.keys()),
+                    fps=args.fps,
+                    session_id=session_id,
+                    log_file=lp.os.path.join(lp.LOG_DIR, f"session_{session_id}.jsonl"),
+                    uploader=uploader,
+                    camera_fps=args.fps,
+                    evidence_fps=lp.EVIDENCE_FPS,
+                )
+                print(f"[INFO] Detection STARTED (session={session_id})", flush=True)
+
+            if detection_active and remote_state == 0:
+                detection_active = False
+                evidence.close_all(time.time())
+                print("[INFO] Detection STOPPED", flush=True)
+
             frame, now_ts, frame_id = hub.get_latest()
             if frame is None:
                 time.sleep(0.01)
@@ -250,44 +330,45 @@ def main():
                     continue
             last_processed_frame_id = frame_id
 
-            evidence.update_frame(frame, now_ts)
+            if detection_active:
+                evidence.update_frame(frame, now_ts)
 
-            roi = enabled_rois[roi_index]
-            sid = roi["id"]
-            student = states[sid]
-            current_index = next(i for i, item in enumerate(rois) if item["id"] == sid)
-            neighbor_roi = None
-            if len(rois) > 1:
-                candidate_neighbor = rois[(current_index + 1) % len(rois)]
-                if candidate_neighbor["id"] != sid and candidate_neighbor["id"] in enabled_roi_ids:
-                    neighbor_roi = candidate_neighbor
-            roi_index = (roi_index + 1) % len(enabled_rois)
+                roi = enabled_rois[roi_index]
+                sid = roi["id"]
+                student = states[sid]
+                current_index = next(i for i, item in enumerate(rois) if item["id"] == sid)
+                neighbor_roi = None
+                if len(rois) > 1:
+                    candidate_neighbor = rois[(current_index + 1) % len(rois)]
+                    if candidate_neighbor["id"] != sid and candidate_neighbor["id"] in enabled_roi_ids:
+                        neighbor_roi = candidate_neighbor
+                roi_index = (roi_index + 1) % len(enabled_rois)
 
-            roi_crop = crop(frame, roi)
-            if roi_crop.size > 0:
-                rgb = cv2.cvtColor(roi_crop, cv2.COLOR_BGR2RGB)
-                result = pose.process(rgb)
-                if result.pose_landmarks:
-                    signals, metrics, reliable_pose = lp.compute_signals(
-                        result.pose_landmarks.landmark,
-                        roi,
-                        neighbor_roi,
-                        student.baseline,
-                    )
-                    if reliable_pose:
-                        student.add_baseline(metrics, signals)
-                        student.update_with_signals(signals, metrics)
-                        student.adapt_baseline(metrics, signals)
+                roi_crop = crop(frame, roi)
+                if roi_crop.size > 0:
+                    rgb = cv2.cvtColor(roi_crop, cv2.COLOR_BGR2RGB)
+                    result = pose.process(rgb)
+                    if result.pose_landmarks:
+                        signals, metrics, reliable_pose = lp.compute_signals(
+                            result.pose_landmarks.landmark,
+                            roi,
+                            neighbor_roi,
+                            student.baseline,
+                        )
+                        if reliable_pose:
+                            student.add_baseline(metrics, signals)
+                            student.update_with_signals(signals, metrics)
+                            student.adapt_baseline(metrics, signals)
+                        else:
+                            signals["EMPTY"] = True
+                            student.update_with_signals(signals, metrics)
                     else:
-                        signals["EMPTY"] = True
-                        student.update_with_signals(signals, metrics)
+                        student.update_no_pose()
                 else:
                     student.update_no_pose()
-            else:
-                student.update_no_pose()
 
-            evidence.update_student(sid, student.window[-1]["signals"], now_ts)
-            evidence.write_active_events(now_ts)
+                evidence.update_student(sid, student.window[-1]["signals"], now_ts)
+                evidence.write_active_events(now_ts)
 
             if not headless:
                 out = frame.copy()
@@ -310,6 +391,7 @@ def main():
     except KeyboardInterrupt:
         print("[INFO] KeyboardInterrupt received. Shutting down.", flush=True)
     finally:
+        poller.stop()
         hub.stop()
         evidence.close_all(time.time())
         if uploader is not None:
