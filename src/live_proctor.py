@@ -496,12 +496,11 @@ class AsyncEventUploader:
 
     def flush_pending_once(self, max_items):
         with self._pending_lock:
-            pending, remainder = self._load_pending(max_items)
+            pending, _ = self._load_pending(max_items)
 
         if not pending:
             return 0
 
-        undelivered = []
         delivered_ids = set()
         for payload in pending:
             ok = self._post_event_with_retries(payload)
@@ -510,28 +509,34 @@ class AsyncEventUploader:
                 if event_id:
                     delivered_ids.add(event_id)
                 continue
-            undelivered.append(payload)
             now = time.monotonic()
             if now - self._last_replay_warn > 10.0:
                 print("[WARN] Pending event replay failed; will retry later.", flush=True)
                 self._last_replay_warn = now
-
-        for payload in remainder:
-            if payload.get("event_id") not in delivered_ids:
-                undelivered.append(payload)
-
         with self._pending_lock:
-            self._rewrite_pending(undelivered)
+            current_pending, current_remainder = self._load_pending(float("inf"))
+            keep = []
+            for payload in current_pending:
+                if payload.get("event_id") not in delivered_ids:
+                    keep.append(payload)
+            for payload in current_remainder:
+                if payload.get("event_id") not in delivered_ids:
+                    keep.append(payload)
+            self._rewrite_pending(keep)
         return len(pending)
 
     def _worker_loop(self):
         self.flush_pending_once(self.max_replay)
         next_pending_flush = time.monotonic() + 10.0
 
-        while not self._stop_event.is_set():
+        while True:
+            if self._stop_event.is_set() and self._queue.empty():
+                break
             try:
                 payload = self._queue.get(timeout=0.5)
             except queue.Empty:
+                if self._stop_event.is_set():
+                    break
                 if time.monotonic() >= next_pending_flush:
                     self.flush_pending_once(self.max_replay)
                     next_pending_flush = time.monotonic() + 10.0
