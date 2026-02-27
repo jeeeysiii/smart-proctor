@@ -1,5 +1,4 @@
 import argparse
-import copy
 import json
 import math
 import os
@@ -66,6 +65,17 @@ PRE_EVENT_SEC = 3
 POST_SILENCE_SEC = 3
 EVIDENCE_FPS = 12
 EVIDENCE_DIR = "evidence"
+LOG_DIR = os.path.join(EVIDENCE_DIR, "logs")
+PENDING_FILE = os.path.join(LOG_DIR, "pending_uploads.jsonl")
+
+
+def atomic_write(path, data_bytes):
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data_bytes)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 class StudentState:
@@ -196,12 +206,12 @@ class StudentState:
 
 
 class EvidenceManager:
-    def __init__(self, student_ids, fps, session_id, log_file, api_client, camera_fps=None, evidence_fps=EVIDENCE_FPS):
+    def __init__(self, student_ids, fps, session_id, log_file, uploader, camera_fps=None, evidence_fps=EVIDENCE_FPS):
         self.fps = int(evidence_fps)
         self.camera_fps = int(fps)
         self.session_id = session_id
         self.log_file = log_file
-        self.api_client = api_client
+        self.uploader = uploader
         self.frame_interval = 1.0 / float(max(1, self.fps))
         self.frame_buffer = deque(maxlen=max(1, int(PRE_EVENT_SEC * max(1, camera_fps or self.fps))))
         self.latest_frame = None
@@ -318,21 +328,21 @@ class EvidenceManager:
 
         event["writer"].release()
         duration = round(event["frame_count"] / float(self.fps), 2)
+        clip_file = event["clip_file"]
         entry = {
-            "session_id": self.session_id,
+            "event_id": f"{self.session_id}:{student_id}:{clip_file}",
             "timestamp": datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat(),
+            "session_id": self.session_id,
             "student_id": student_id,
             "signals": sorted(event["signals"]),
-            "clip_file": event["clip_file"],
+            "clip_file": clip_file,
             "duration_sec": duration,
         }
-        with open(self.log_file, "a") as f:
+        with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
 
-        if self.api_client is not None:
-            ok = self.api_client.send_event(entry)
-            if not ok:
-                print("[WARN] Failed to POST event log; kept in JSONL.", flush=True)
+        if self.uploader is not None:
+            self.uploader.enqueue(entry)
 
         event["active"] = False
         event["start_time"] = None
@@ -350,50 +360,202 @@ class EvidenceManager:
             self._close_event(student_id, timestamp)
 
 
-class EventAPIClient:
-    def __init__(self, url: str, timeout_sec: float = 2.0, max_queue_size: int = 256):
+class AsyncEventUploader:
+    def __init__(self, url: str, timeout_sec: float, pending_file: str, max_replay: int = 5000, max_queue_size: int = 256):
         self.url = url
         self.timeout_sec = float(timeout_sec)
+        self.pending_file = pending_file
+        self.max_replay = int(max_replay)
         self._queue = queue.Queue(maxsize=max_queue_size)
-        self._stop_sentinel = object()
-        self._worker = threading.Thread(target=self._worker_loop, name="event-log-uploader", daemon=True)
-        self._worker.start()
+        self._pending_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._session = requests.Session()
+        self._session.headers.update({"User-Agent": "smart-proctor-pi/1.0", "Accept": "application/json"})
+        self._thread = threading.Thread(target=self._worker_loop, name="event-log-uploader", daemon=True)
+        self._recent_pending_ids = set()
+        self._last_queue_full_warn = 0.0
+        self._last_replay_warn = 0.0
 
-    def _post_event(self, payload: dict) -> bool:
-        headers = {"User-Agent": "smart-proctor-pi/1.0", "Accept": "application/json"}
-        response = requests.post(self.url, json=payload, headers=headers, timeout=self.timeout_sec)
-        if response.status_code == 200:
+        os.makedirs(os.path.dirname(self.pending_file) or ".", exist_ok=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def join(self, timeout=None):
+        self._thread.join(timeout=timeout)
+        try:
+            self._session.close()
+        except Exception:
+            pass
+
+    def enqueue(self, payload, ensure_pending=False):
+        event_id = payload.get("event_id")
+        if ensure_pending and event_id:
+            self._append_pending(payload)
+        try:
+            self._queue.put_nowait(dict(payload))
             return True
-        print(f"[WARN] Event log post failed: HTTP {response.status_code}: {response.text[:200]}", flush=True)
+        except queue.Full:
+            self._append_pending(payload)
+            now = time.monotonic()
+            if now - self._last_queue_full_warn > 5.0:
+                print("[WARN] Event upload queue full; deferred to pending_uploads.jsonl", flush=True)
+                self._last_queue_full_warn = now
+            return False
+
+    def _post_event_with_retries(self, payload):
+        t = max(0.1, self.timeout_sec)
+        connect_timeout = min(2.0, t)
+        read_timeout = max(t, 10.0)
+        backoff = [0.2, 0.5]
+        attempts = 3
+
+        for idx in range(attempts):
+            try:
+                response = self._session.post(self.url, json=payload, timeout=(connect_timeout, read_timeout))
+                if response.status_code == 200:
+                    return True
+                body = (response.text or "")[:200]
+                print(f"[WARN] Event log POST failed: HTTP {response.status_code}: {body}", flush=True)
+                return False
+            except (requests.ReadTimeout, requests.ConnectionError) as exc:
+                if idx + 1 >= attempts:
+                    print(f"[WARN] Event log POST network failure after retries: {exc}", flush=True)
+                    return False
+                time.sleep(backoff[idx])
+            except requests.RequestException as exc:
+                print(f"[WARN] Event log POST failed: {exc}", flush=True)
+                return False
         return False
 
+    def _append_pending(self, payload):
+        event_id = payload.get("event_id")
+        if not event_id:
+            return
+        with self._pending_lock:
+            if event_id in self._recent_pending_ids:
+                return
+            with open(self.pending_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload) + "\n")
+            self._recent_pending_ids.add(event_id)
+            if len(self._recent_pending_ids) > 8192:
+                self._recent_pending_ids.clear()
+
+    def _load_pending(self, max_items):
+        if not os.path.exists(self.pending_file):
+            return [], []
+        pending = []
+        remainder = []
+        malformed = 0
+        parsed_count = 0
+        with open(self.pending_file, "r", encoding="utf-8") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    malformed += 1
+                    continue
+                if parsed_count < max_items:
+                    pending.append(payload)
+                else:
+                    remainder.append(payload)
+                parsed_count += 1
+        if malformed:
+            print(f"[WARN] Ignored {malformed} malformed pending upload lines.", flush=True)
+        return pending, remainder
+
+    def _rewrite_pending(self, payloads):
+        lines = []
+        seen = set()
+        for payload in payloads:
+            event_id = payload.get("event_id")
+            if not event_id or event_id in seen:
+                continue
+            seen.add(event_id)
+            lines.append(json.dumps(payload))
+
+        data = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
+        atomic_write(self.pending_file, data)
+        self._recent_pending_ids = seen
+
+    def _remove_pending_event_ids(self, event_ids):
+        valid_ids = {eid for eid in event_ids if eid}
+        if not valid_ids:
+            return
+        with self._pending_lock:
+            pending, remainder = self._load_pending(self.max_replay)
+            keep = [payload for payload in pending if payload.get("event_id") not in valid_ids]
+            keep.extend(payload for payload in remainder if payload.get("event_id") not in valid_ids)
+            self._rewrite_pending(keep)
+
+    def flush_pending_once(self, max_items):
+        with self._pending_lock:
+            pending, _ = self._load_pending(max_items)
+
+        if not pending:
+            return 0
+
+        delivered_ids = set()
+        for payload in pending:
+            ok = self._post_event_with_retries(payload)
+            event_id = payload.get("event_id")
+            if ok:
+                if event_id:
+                    delivered_ids.add(event_id)
+                continue
+            now = time.monotonic()
+            if now - self._last_replay_warn > 10.0:
+                print("[WARN] Pending event replay failed; will retry later.", flush=True)
+                self._last_replay_warn = now
+        with self._pending_lock:
+            current_pending, current_remainder = self._load_pending(float("inf"))
+            keep = []
+            for payload in current_pending:
+                if payload.get("event_id") not in delivered_ids:
+                    keep.append(payload)
+            for payload in current_remainder:
+                if payload.get("event_id") not in delivered_ids:
+                    keep.append(payload)
+            self._rewrite_pending(keep)
+        return len(pending)
+
     def _worker_loop(self):
+        self.flush_pending_once(self.max_replay)
+        next_pending_flush = time.monotonic() + 10.0
+
         while True:
-            payload = self._queue.get()
+            if self._stop_event.is_set() and self._queue.empty():
+                break
             try:
-                if payload is self._stop_sentinel:
-                    return
-                self._post_event(payload)
-            except requests.RequestException as exc:
-                print(f"[WARN] Event log post failed: {exc}", flush=True)
+                payload = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                if self._stop_event.is_set():
+                    break
+                if time.monotonic() >= next_pending_flush:
+                    self.flush_pending_once(self.max_replay)
+                    next_pending_flush = time.monotonic() + 10.0
+                continue
+
+            try:
+                ok = self._post_event_with_retries(payload)
+                if ok:
+                    self._remove_pending_event_ids({payload.get("event_id")})
+                else:
+                    self._append_pending(payload)
             finally:
                 self._queue.task_done()
 
-    def send_event(self, payload: dict) -> bool:
-        try:
-            self._queue.put_nowait(copy.deepcopy(payload))
-            return True
-        except queue.Full:
-            print("[WARN] Event upload queue full; kept event in JSONL only.", flush=True)
-            return False
+            if time.monotonic() >= next_pending_flush:
+                self.flush_pending_once(self.max_replay)
+                next_pending_flush = time.monotonic() + 10.0
 
-    def close(self):
-        try:
-            self._queue.put(self._stop_sentinel)
-            self._worker.join(timeout=self.timeout_sec + 1.0)
-        except Exception:
-            return
-
+        self.flush_pending_once(self.max_replay)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Live smart proctor with MediaPipe Pose on Raspberry Pi")
@@ -665,18 +827,19 @@ def validate_live_rois(rois):
 def main():
     args = parse_args()
     session_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    log_dir = "evidence/logs"
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"session_{session_id}.jsonl")
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_file = os.path.join(LOG_DIR, f"session_{session_id}.jsonl")
 
     post_url = os.environ.get("SP_LOG_POST_URL", "").strip()
-    timeout_sec = float(os.environ.get("SP_LOG_TIMEOUT_SEC", "2.0"))
+    timeout_sec = float(os.environ.get("SP_LOG_TIMEOUT_SEC", "6.0"))
+    max_replay = int(os.environ.get("SP_LOG_MAX_PENDING_REPLAY", "5000"))
     if post_url:
-        api_client = EventAPIClient(post_url, timeout_sec=timeout_sec)
+        uploader = AsyncEventUploader(post_url, timeout_sec=timeout_sec, pending_file=PENDING_FILE, max_replay=max_replay)
+        uploader.start()
         print(f"[INFO] Event log POST enabled: {post_url}", flush=True)
     else:
-        api_client = None
-        print("[WARN] SP_LOG_POST_URL not set; DB upload disabled (JSONL only).", flush=True)
+        uploader = None
+        print("[WARN] SP_LOG_POST_URL not set; uploading disabled (session JSONL only).", flush=True)
 
     _, rois = load_rois(args.rois)
     validate_live_rois(rois)
@@ -712,7 +875,7 @@ def main():
         fps=args.fps,
         session_id=session_id,
         log_file=log_file,
-        api_client=api_client,
+        uploader=uploader,
         camera_fps=args.fps,
         evidence_fps=EVIDENCE_FPS,
     )
@@ -787,8 +950,9 @@ def main():
 
     finally:
         evidence.close_all(time.time())
-        if api_client is not None:
-            api_client.close()
+        if uploader is not None:
+            uploader.stop()
+            uploader.join(3.0)
         camera.release()
         pose.close()
         if not headless:
