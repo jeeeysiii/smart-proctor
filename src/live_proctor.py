@@ -16,6 +16,8 @@ import requests
 from .camera_source import create_camera_source
 from .utils_rois import crop, load_rois
 
+DEVICE_ID = "2026"
+
 SIGNAL_NAMES = ["ROT", "BOUND", "REACH", "LEAN", "STAND", "EMPTY"]
 POINTS = {
     "ROT": 1,
@@ -344,8 +346,9 @@ class EvidenceManager:
         duration = round(event["frame_count"] / float(self.fps), 2)
         clip_file = event["clip_file"]
         entry = {
-            "event_id": f"{self.session_id}:{student_id}:{clip_file}",
+            "event_id": f"{DEVICE_ID}:{self.session_id}:{student_id}:{clip_file}",
             "timestamp": datetime.fromtimestamp(timestamp).astimezone().isoformat(),
+            "device_id": DEVICE_ID,
             "session_id": self.session_id,
             "student_id": student_id,
             "signals": sorted(event["signals"]),

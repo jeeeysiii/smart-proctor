@@ -13,6 +13,8 @@ from .camera_source import create_camera_source
 from .utils_rois import crop, load_rois
 from .video_stream_mjpeg import build_app
 
+DEVICE_ID = "2026"
+
 
 class FrameHub:
     def __init__(self, camera_source):
