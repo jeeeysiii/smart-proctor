@@ -252,11 +252,4 @@ Event metadata includes:
 
 ---
 
-## 11) About removing scripts
-
-You suggested removing unnecessary scripts. Good idea, but recommended approach is:
-1. mark scripts as `legacy` first,
-2. verify nobody uses them in deployment/docs,
-3. remove in a separate cleanup PR.
-
-For now, this README documents the current state clearly and identifies `live_proctor_stream.py` as the main entrypoint.
+This README documents the current state clearly and identifies `live_proctor_stream.py` as the main entrypoint.
