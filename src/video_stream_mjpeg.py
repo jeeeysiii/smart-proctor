@@ -6,7 +6,6 @@ from typing import Optional
 
 import cv2
 from flask import Flask, Response, abort, request, send_from_directory
-from werkzeug.utils import secure_filename
 
 from .camera_source import create_camera_source
 
@@ -157,8 +156,8 @@ def build_app(broadcaster: FrameBroadcaster, args):
             "/" in filename
             or "\\" in filename
             or ".." in filename
+            or "\x00" in filename
             or not filename.lower().endswith(".mp4")
-            or filename != secure_filename(filename)
         ):
             abort(400)
 
