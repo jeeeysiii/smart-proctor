@@ -1,10 +1,11 @@
 import argparse
+import os
 import threading
 import time
 from typing import Optional
 
 import cv2
-from flask import Flask, Response, abort, request
+from flask import Flask, Response, abort, request, send_from_directory
 
 from .camera_source import create_camera_source
 
@@ -105,6 +106,8 @@ def token_required(expected_token: Optional[str]):
 
 def build_app(broadcaster: FrameBroadcaster, args):
     app = Flask(__name__)
+    evidence_dir = getattr(args, "evidence_dir", "evidence")
+    evidence_dir = os.path.abspath(evidence_dir)
 
     @app.route("/health")
     def health():
@@ -144,6 +147,33 @@ def build_app(broadcaster: FrameBroadcaster, args):
                 "Access-Control-Allow-Headers": "*",
             }
         )
+
+    @app.route("/clip/<path:filename>")
+    def clip(filename):
+        token_required(args.token)
+
+        if (
+            "/" in filename
+            or "\\" in filename
+            or ".." in filename
+            or "\x00" in filename
+            or not filename.lower().endswith(".mp4")
+        ):
+            abort(400)
+
+        if not os.path.isdir(evidence_dir):
+            abort(404)
+
+        response = send_from_directory(
+            evidence_dir,
+            filename,
+            as_attachment=True,
+            download_name=filename,
+        )
+        response.headers["Access-Control-Allow-Origin"] = "https://smartproctoring.online"
+        response.headers["Access-Control-Allow-Methods"] = "GET"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        return response
 
     return app
 
