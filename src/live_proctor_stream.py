@@ -127,7 +127,6 @@ class HubBroadcaster:
         self._last_emit = 0.0
         self._overlay_frame = None
         self._overlay_frame_id = 0
-        self._overlay_enabled = False
         self._lock = threading.Lock()
 
     def _apply_flip(self, frame):
@@ -143,9 +142,13 @@ class HubBroadcaster:
         if frame is None:
             return
         with self._lock:
-            self._overlay_enabled = True
-            self._overlay_frame = frame.copy()
+            self._overlay_frame = frame
             self._overlay_frame_id = int(frame_id)
+
+    def clear_overlay_frame(self):
+        with self._lock:
+            self._overlay_frame = None
+            self._overlay_frame_id = 0
 
     def start(self):
         return
@@ -155,21 +158,10 @@ class HubBroadcaster:
 
     def wait_next(self, last_frame_id, timeout=2.0):
         with self._lock:
-            overlay_frame = None if self._overlay_frame is None else self._overlay_frame.copy()
+            overlay_frame = self._overlay_frame
             overlay_frame_id = self._overlay_frame_id
-            overlay_enabled = self._overlay_enabled
 
         if overlay_frame is not None and overlay_frame_id > last_frame_id:
-            frame = overlay_frame
-            frame_id = overlay_frame_id
-        elif overlay_enabled:
-            self.hub.wait_next(last_frame_id, timeout=timeout)
-            with self._lock:
-                overlay_frame = None if self._overlay_frame is None else self._overlay_frame.copy()
-                overlay_frame_id = self._overlay_frame_id
-            if overlay_frame is None or overlay_frame_id <= last_frame_id:
-                time.sleep(0.01)
-                return last_frame_id, None
             frame = overlay_frame
             frame_id = overlay_frame_id
         else:
@@ -218,12 +210,14 @@ def parse_args():
     parser.add_argument("--jpeg-quality", type=int, default=80, help="JPEG quality 1..100")
     parser.add_argument("--flip", choices=["none", "h", "v", "hv"], default="none", help="Optional stream frame flip")
     parser.add_argument("--token", default=None, help="Optional token required by /mjpeg and /")
+    parser.add_argument("--overlay", choices=["on", "off"], default="on", help="Show proctor overlay on preview and MJPEG stream")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     session_id = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S")
+    overlay_enabled = args.overlay == "on"
     print(f"[INFO] Local now: {datetime.now().astimezone().isoformat()}", flush=True)
 
     lp.os.makedirs(lp.LOG_DIR, exist_ok=True)
@@ -297,6 +291,8 @@ def main():
             f"(max_fps={args.stream_max_fps}, jpeg_quality={args.jpeg_quality}, flip={args.flip})",
             flush=True,
         )
+
+    print(f"[INFO] Overlay: {args.overlay}", flush=True)
 
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(
@@ -400,10 +396,14 @@ def main():
                 evidence.update_student(sid, student.window[-1]["signals"], now_ts)
                 evidence.write_active_events(now_ts)
 
-            out = frame.copy()
-            lp.draw_proctor_overlay(out, rois, states, enabled_roi_ids)
-            if stream_broadcaster is not None:
-                stream_broadcaster.set_overlay_frame(out, frame_id)
+            out = frame
+            if overlay_enabled and (stream_broadcaster is not None or not headless):
+                out = frame.copy()
+                lp.draw_proctor_overlay(out, rois, states, enabled_roi_ids)
+                if stream_broadcaster is not None:
+                    stream_broadcaster.set_overlay_frame(out, frame_id)
+            elif stream_broadcaster is not None:
+                stream_broadcaster.clear_overlay_frame()
 
             if not headless:
                 cv2.imshow("Smart Proctor Live", out)
