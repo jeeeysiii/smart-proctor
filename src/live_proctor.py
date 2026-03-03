@@ -812,6 +812,41 @@ def draw_overlay(frame, rois, states, enabled_roi_ids, debug_overlay=False):
                 cv2.putText(frame, line2, (x + 4, y2), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
 
 
+def draw_proctor_overlay(frame, rois, states, enabled_roi_ids):
+    colors = {
+        "OK": (255, 255, 255),
+        "WARN": (0, 255, 255),
+        "FLAG": (0, 0, 255),
+        "NO_POSE": (128, 128, 128),
+    }
+    for roi in rois:
+        sid = roi["id"]
+        st = states[sid]
+        x, y, w, h = int(roi["x"]), int(roi["y"]), int(roi["w"]), int(roi["h"])
+        is_enabled = sid in enabled_roi_ids
+        if not is_enabled:
+            disabled_color = (80, 80, 80)
+            cv2.rectangle(frame, (x, y), (x + w, y + h), disabled_color, 2)
+            cv2.putText(
+                frame,
+                f"{sid} DISABLED",
+                (x + 4, max(12, y + 12)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                disabled_color,
+                1,
+                cv2.LINE_AA,
+            )
+            continue
+
+        color = colors.get(st.state, (255, 255, 255))
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+
+        status = ",".join(st.active_signals) if st.active_signals else "OK"
+        line1 = f"{sid} {status}"
+        cv2.putText(frame, line1, (x + 4, max(12, y + 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+
 def print_periodic_summary(rois, states, enabled_roi_ids, show_disabled=False):
     parts = []
     for roi in rois:
