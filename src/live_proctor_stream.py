@@ -127,6 +127,7 @@ class HubBroadcaster:
         self._last_emit = 0.0
         self._overlay_frame = None
         self._overlay_frame_id = 0
+        self._overlay_enabled = False
         self._lock = threading.Lock()
 
     def _apply_flip(self, frame):
@@ -142,6 +143,7 @@ class HubBroadcaster:
         if frame is None:
             return
         with self._lock:
+            self._overlay_enabled = True
             self._overlay_frame = frame.copy()
             self._overlay_frame_id = int(frame_id)
 
@@ -155,8 +157,19 @@ class HubBroadcaster:
         with self._lock:
             overlay_frame = None if self._overlay_frame is None else self._overlay_frame.copy()
             overlay_frame_id = self._overlay_frame_id
+            overlay_enabled = self._overlay_enabled
 
         if overlay_frame is not None and overlay_frame_id > last_frame_id:
+            frame = overlay_frame
+            frame_id = overlay_frame_id
+        elif overlay_enabled:
+            self.hub.wait_next(last_frame_id, timeout=timeout)
+            with self._lock:
+                overlay_frame = None if self._overlay_frame is None else self._overlay_frame.copy()
+                overlay_frame_id = self._overlay_frame_id
+            if overlay_frame is None or overlay_frame_id <= last_frame_id:
+                time.sleep(0.01)
+                return last_frame_id, None
             frame = overlay_frame
             frame_id = overlay_frame_id
         else:
