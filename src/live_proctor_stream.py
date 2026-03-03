@@ -215,12 +215,14 @@ def parse_args():
     parser.add_argument("--jpeg-quality", type=int, default=80, help="JPEG quality 1..100")
     parser.add_argument("--flip", choices=["none", "h", "v", "hv"], default="none", help="Optional stream frame flip")
     parser.add_argument("--token", default=None, help="Optional token required by /mjpeg and /")
+    parser.add_argument("--overlay", choices=["on", "off"], default="on", help="Show proctor overlay on preview and MJPEG stream")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     session_id = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S")
+    overlay_enabled = args.overlay == "on"
     print(f"[INFO] Local now: {datetime.now().astimezone().isoformat()}", flush=True)
 
     lp.os.makedirs(lp.LOG_DIR, exist_ok=True)
@@ -294,6 +296,8 @@ def main():
             f"(max_fps={args.stream_max_fps}, jpeg_quality={args.jpeg_quality}, flip={args.flip})",
             flush=True,
         )
+
+    print(f"[INFO] Overlay: {args.overlay}", flush=True)
 
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(
@@ -397,10 +401,14 @@ def main():
                 evidence.update_student(sid, student.window[-1]["signals"], now_ts)
                 evidence.write_active_events(now_ts)
 
-            out = frame.copy()
-            lp.draw_proctor_overlay(out, rois, states, enabled_roi_ids)
-            if stream_broadcaster is not None:
-                stream_broadcaster.set_overlay_frame(out, frame_id)
+            out = frame
+            if overlay_enabled and (stream_broadcaster is not None or not headless):
+                out = frame.copy()
+                lp.draw_proctor_overlay(out, rois, states, enabled_roi_ids)
+                if stream_broadcaster is not None:
+                    stream_broadcaster.set_overlay_frame(out, frame_id)
+            elif stream_broadcaster is not None:
+                stream_broadcaster.clear_overlay_frame()
 
             if not headless:
                 cv2.imshow("Smart Proctor Live", out)
