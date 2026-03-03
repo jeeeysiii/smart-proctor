@@ -125,6 +125,9 @@ class HubBroadcaster:
         self.jpeg_quality = int(max(1, min(100, jpeg_quality)))
         self.flip_mode = flip_mode
         self._last_emit = 0.0
+        self._overlay_frame = None
+        self._overlay_frame_id = 0
+        self._lock = threading.Lock()
 
     def _apply_flip(self, frame):
         if self.flip_mode == "h":
@@ -135,6 +138,13 @@ class HubBroadcaster:
             return cv2.flip(frame, -1)
         return frame
 
+    def set_overlay_frame(self, frame, frame_id):
+        if frame is None:
+            return
+        with self._lock:
+            self._overlay_frame = frame.copy()
+            self._overlay_frame_id = int(frame_id)
+
     def start(self):
         return
 
@@ -142,12 +152,20 @@ class HubBroadcaster:
         return
 
     def wait_next(self, last_frame_id, timeout=2.0):
-        frame, _ts, frame_id = self.hub.wait_next(last_frame_id, timeout=timeout)
-        if frame is None:
-            return frame_id, None
-        if frame_id == last_frame_id:
-            time.sleep(0.01)
-            return frame_id, None
+        with self._lock:
+            overlay_frame = None if self._overlay_frame is None else self._overlay_frame.copy()
+            overlay_frame_id = self._overlay_frame_id
+
+        if overlay_frame is not None and overlay_frame_id > last_frame_id:
+            frame = overlay_frame
+            frame_id = overlay_frame_id
+        else:
+            frame, _ts, frame_id = self.hub.wait_next(last_frame_id, timeout=timeout)
+            if frame is None:
+                return frame_id, None
+            if frame_id == last_frame_id:
+                time.sleep(0.01)
+                return frame_id, None
 
         now = time.monotonic()
         sleep_for = (self._last_emit + self.frame_interval) - now
@@ -293,7 +311,6 @@ def main():
 
     roi_index = 0
     last_print_ts = time.time()
-    debug_overlay = lp.DEBUG_OVERLAY
     last_processed_frame_id = 0
 
     try:
@@ -370,16 +387,17 @@ def main():
                 evidence.update_student(sid, student.window[-1]["signals"], now_ts)
                 evidence.write_active_events(now_ts)
 
+            out = frame.copy()
+            lp.draw_proctor_overlay(out, rois, states, enabled_roi_ids)
+            if stream_broadcaster is not None:
+                stream_broadcaster.set_overlay_frame(out, frame_id)
+
             if not headless:
-                out = frame.copy()
-                lp.draw_overlay(out, rois, states, enabled_roi_ids, debug_overlay=debug_overlay)
                 cv2.imshow("Smart Proctor Live", out)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("r"):
                     for s in states.values():
                         s.reset_baseline()
-                if key == ord("d"):
-                    debug_overlay = not debug_overlay
                 if key == 27:
                     break
 
