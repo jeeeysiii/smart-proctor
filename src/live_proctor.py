@@ -842,7 +842,9 @@ def draw_proctor_overlay(frame, rois, states, enabled_roi_ids):
         color = colors.get(st.state, (255, 255, 255))
         cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
 
-        status = ",".join(st.active_signals) if st.active_signals else "OK"
+        status = st.state
+        if st.active_signals:
+            status = f"{status}:{','.join(st.active_signals)}"
         line1 = f"{sid} {status}"
         cv2.putText(frame, line1, (x + 4, max(12, y + 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
