@@ -127,6 +127,7 @@ class HubBroadcaster:
         self._last_emit = 0.0
         self._overlay_frame = None
         self._overlay_frame_id = 0
+        self._overlay_enabled = False
         self._lock = threading.Lock()
         self._overlay_cond = threading.Condition(self._lock)
 
@@ -147,11 +148,6 @@ class HubBroadcaster:
             self._overlay_frame = frame.copy()
             self._overlay_frame_id = int(frame_id)
             self._overlay_cond.notify_all()
-
-    def clear_overlay_frame(self):
-        with self._lock:
-            self._overlay_frame = None
-            self._overlay_frame_id = 0
 
     def start(self):
         return
